@@ -1,0 +1,15 @@
+The following two repos are required to run benchmark comparisons:
+
+Clone the following repos
+
+https://github.com/SamuelReyd/ActualCausesIdentification
+commit e1f9b5f5dbe549582e2ce516d301b6008f302167
+
+https://github.com/amjadKhalifah/HP2SAT1.0/
+branch hp-optimization-library
+commit be33600c71ec7d0aeaa3fcbe59d5c96376771c73
+
+and apply the following patches:
+
+git apply ../actualCauses.patch
+git apply ../HP2SAT.patch

@@ -1,0 +1,3657 @@
+diff --git a/pom.xml b/pom.xml
+index ea69267..72247c3 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -72,14 +72,6 @@
+ 			<version>2.0.0-SNAPSHOT</version>
+ 		</dependency>
+ 
+-		<!-- mvn install:install-file -Dfile=gurobi.jar -DgroupId=gurobi -DartifactId=gurobi 
+-			-Dversion=8.0 -Dpackaging=jar -->
+-		<dependency>
+-			<groupId>gurobi</groupId>
+-			<artifactId>gurobi</artifactId>
+-			<version>8.0</version>
+-		</dependency>
+-
+ 		<dependency>
+ 			<groupId>com.google.code.gson</groupId>
+ 			<artifactId>gson</artifactId>
+diff --git a/src/main/java/de/tum/in/i4/hp2sat/causality/CausalModel.java b/src/main/java/de/tum/in/i4/hp2sat/causality/CausalModel.java
+index dcea355..b1b1f4b 100644
+--- a/src/main/java/de/tum/in/i4/hp2sat/causality/CausalModel.java
++++ b/src/main/java/de/tum/in/i4/hp2sat/causality/CausalModel.java
+@@ -129,6 +129,26 @@ public class CausalModel {
+         return causalitySolver.solve(this, context, phi, cause, solvingStrategy);
+     }
+ 
++    /**
++     * Finds all actual causes for the given context and phi using the specified solving strategy.
++     * Public wrapper around {@link CausalitySolver#getAllCauses} for external (e.g., Python/JPype) callers.
++     */
++    public java.util.Set<CausalitySolverResult> getAllCauses(Set<Literal> context, Formula phi,
++                                                              SolvingStrategy solvingStrategy)
++            throws InvalidCausalModelException {
++        CausalitySolver solver;
++        if (solvingStrategy == BRUTE_FORCE || solvingStrategy == BRUTE_FORCE_OPTIMIZED_W) {
++            solver = new BruteForceCausalitySolver();
++        } else if (solvingStrategy == MAX_SAT) {
++            solver = new MaxSATCausalitySolver();
++        } else if (solvingStrategy == ILP || solvingStrategy == ILP_WHY) {
++            solver = new ILPCausalitySolver();
++        } else {
++            solver = new SATCausalitySolver();
++        }
++        return solver.getAllCauses(this, context, phi, solvingStrategy, this.formulaFactory);
++    }
++
+     /**
+      * see {@link #isCause(Set, Formula, Set, SolvingStrategy, SATSolverType)} for a full documentation. The only
+      * difference is that in the current method the to be used SAT solver can be specified. This only works if the
+diff --git a/src/main/java/de/tum/in/i4/hp2sat/causality/ILPCausalitySolver.java b/src/main/java/de/tum/in/i4/hp2sat/causality/ILPCausalitySolver.java
+index f4fdb27..6ecce29 100644
+--- a/src/main/java/de/tum/in/i4/hp2sat/causality/ILPCausalitySolver.java
++++ b/src/main/java/de/tum/in/i4/hp2sat/causality/ILPCausalitySolver.java
+@@ -1,526 +1,15 @@
+ package de.tum.in.i4.hp2sat.causality;
+ 
+ import de.tum.in.i4.hp2sat.exceptions.InvalidCausalModelException;
+-import gurobi.GRB;
+-import gurobi.GRBEnv;
+-import gurobi.GRBException;
+-import gurobi.GRBLinExpr;
+-import gurobi.GRBModel;
+-import gurobi.GRBVar;
+-
+-import org.logicng.datastructures.Assignment;
+ import org.logicng.formulas.Formula;
+-import org.logicng.formulas.FormulaFactory;
+ import org.logicng.formulas.Literal;
+-import org.logicng.formulas.Variable;
+-import org.logicng.io.parsers.ParserException;
+-import org.logicng.transformations.cnf.CNFConfig;
+-import org.logicng.transformations.cnf.CNFEncoder;
+-import org.logicng.util.Pair;
+-
+-import java.util.*;
+-import java.util.function.Function;
+-import java.util.stream.Collectors;
+-
+-import static de.tum.in.i4.hp2sat.causality.ILPSolverType.GUROBI;
+-import static de.tum.in.i4.hp2sat.causality.SolvingStrategy.*;
++import java.util.Set;
+ 
+ public class ILPCausalitySolver extends CausalitySolver {
+-	private static final String DISTANCE_VAR_NAME = "res";
+-
+-	/**
+-	 * Overrides {@link CausalitySolver#solve(CausalModel, Set, Formula, Set, SolvingStrategy)}.
+-	 * Default SATSolver: MINISAT
+-	 *
+-	 * @param causalModel     the underlying causal model
+-	 * @param context         the context
+-	 * @param phi             the phi
+-	 * @param cause           the cause
+-	 * @param solvingStrategy the applied solving strategy
+-	 * @return for each AC, true if fulfilled, false else
+-	 * @throws InvalidCausalModelException thrown if internally generated causal models are invalid
+-	 */
+-	@Override
+-	public
+-	CausalitySolverResult solve(CausalModel causalModel, Set<Literal> context, Formula phi, Set<Literal> cause,
+-			SolvingStrategy solvingStrategy) throws InvalidCausalModelException {
+-		return solve(causalModel, context, phi, cause, solvingStrategy, GUROBI);
+-	}
+-
+-	/**
+-	 * Checks AC1, AC2 and AC3 given a causal model, a cause, a context and phi and a solving strategy.
+-	 *
+-	 * @param causalModel     the underlying causal model
+-	 * @param context         the context
+-	 * @param phi             the phi
+-	 * @param cause           the cause
+-	 * @param solvingStrategy the applied solving strategy
+-	 * @param satSolverType   the to be used SAT solver
+-	 * @return for each AC, true if fulfilled, false else
+-	 * @throws InvalidCausalModelException thrown if internally generated causal models are invalid
+-	 */
+-	public CausalitySolverResult solve(CausalModel causalModel, Set<Literal> context, Formula phi,
+-			Set<Literal> cause, SolvingStrategy solvingStrategy, ILPSolverType solverType)
+-					throws InvalidCausalModelException {
+-		FormulaFactory f = new FormulaFactory();
+-		Set<Literal> evaluation = CausalitySolver.evaluateEquations(causalModel, context);
+-		Pair<Boolean, Boolean> ac1Tuple = fulfillsAC1(evaluation, phi, cause);
+-		boolean ac1 = ac1Tuple.first() && ac1Tuple.second();
+-		boolean ac2 = false,ac3=false;
+-		Set<Literal> w ;
+-		Set<Literal> minimalCause ;
+-		// in ILP we want to check the two conditions in one-go
+-		Pair<Set<Literal>, Set<Literal>> ac2ac3 = fulfillsAC2AC3(causalModel, phi, cause, context, evaluation,
+-				solvingStrategy, solverType, f);
+-
+-		minimalCause = ac2ac3.first();
+-		w = ac2ac3.second();
+-
+-		if ( minimalCause!=null ){
+-			if (minimalCause.isEmpty()){// means we did n't have to flip anything, couldn't happen because of minimum distance constraint
+-				ac2=ac3=false;
+-				System.out.println("The effect is not at all affected by the cause");
+-			}
+-			else if (minimalCause.size() == cause.size()){// this means ac2 and ac3 are fulfilled 
+-				ac2=true;
+-				ac3=true;
+-				System.out.println("The cause is minimal and counterfactual.");
+-			}
+-			else // there is a more minimal cause
+-			{
+-				ac2 = true; // maybe this is a harsh conclusion 
+-				ac3 = false;
+-				System.out.println("There is a minimal subset of the cause, i.e,:"+ minimalCause);
+-			}
+-
+-		}else{ // for the sake of unit-testing
+-			minimalCause = cause;
+-			w= new HashSet<>();
+-			}
+-
+-		//TODO maybe here filter the w based on relevance to x.
+-		CausalitySolverResult causalitySolverResult = new CausalitySolverResult(ac1, ac2, ac3, minimalCause, w);
+-		return causalitySolverResult;
+-	}
+-
+-
+-	/**
+-	 * Checks if AC2 and AC3 are fulfilled. Combined approach that takes advantage of synergies between the separate
+-	 * approaches.
+-	 *
+-	 * @param causalModel     the underlying causal model
+-	 * @param phi             the phi
+-	 * @param cause           the cause for which we check AC2
+-	 * @param context         the context
+-	 * @param evaluation      the original evaluation of variables
+-	 * @param solvingStrategy the solving strategy
+-	 * @param satSolverType   the to be used SAT solver
+-	 * @param f               a formula factory
+-	 * @return a tuple of set W and a boolean value indicating whether AC3 is fulfilled or not
+-	 * @throws InvalidCausalModelException thrown if internally generated causal models are invalid
+-	 */
+-	private Pair<Set<Literal>, Set<Literal>> fulfillsAC2AC3(CausalModel causalModel, Formula phi, Set<Literal> cause,
+-			Set<Literal> context, Set<Literal> evaluation, SolvingStrategy solvingStrategy, ILPSolverType iLPSolverType,
+-			FormulaFactory f) throws InvalidCausalModelException {
+-		// in ILP we don't handle the but-for explicitly, because we are considering the 
+-		Pair<Set<Literal>, Set<Literal>> result;
+-		Formula phiNegated = f.not(phi);
+-		Formula formula = generateSATQuery(causalModel, phiNegated, cause, context, evaluation, solvingStrategy, true,f);
+-		try {
+-			result = solveILP(f, causalModel,phi, formula, cause, evaluation);
+-		} catch (ParserException | GRBException e) {
+-			result= null;
+-			e.printStackTrace();
+-		}
+-
+-
+-		return result;
+-	}
+-
+-	/**
+-	 * Compute a not necessarily minimal W.
+-	 *
+-	 * @param causalModelModified causal model where the equations of the cause are replaced respectively
+-	 * @param evaluation          the evaluation in the original causal model
+-	 * @param assignment          a satisfying assignment
+-	 * @return a set W if AC2 is fulfilled; null otherwise
+-	 */
+-	private Set<Literal> getWStandard(CausalModel causalModelModified, Set<Literal> evaluation, Assignment assignment) {
+-		// generate (maximum) W
+-		Set<Literal> w = assignment.literals().stream()
+-				.filter(l -> evaluation.contains(l)
+-						&& !causalModelModified.getExogenousVariables().contains(l.variable()))
+-				.collect(Collectors.toSet());
+-		return w;
+-	}
+-
+-	/**
+-	 * Computes a minimal W.
+-	 *
+-	 * @param causalModelModified causal model where the equations of the cause are replaced respectively
+-	 * @param evaluation          the evaluation in the original causal model
+-	 * @param assignments         list of satisfying assignments
+-	 * @return a set W if AC2 is fulfilled; null otherwise
+-	 */
+-	private Set<Literal> getWMinimal(CausalModel causalModelModified, Set<Literal> evaluation,
+-			List<Assignment> assignments) {
+-		Set<Literal> w = null;
+-		Map<Variable, Equation> variableEquationMap = causalModelModified.getVariableEquationMap();
+-		// loop through all satisfying assignments; the first one found might not expose a minimal W
+-		for (Assignment assignment : assignments) {
+-			/*
+-			 * we construct a set of literals that are possibly in W. This set is equal to the one constructed in
+-			 * the standard approach
+-			 * */
+-			Set<Literal> wCandidates = assignment.literals().stream()
+-					.filter(l -> evaluation.contains(l)
+-							&& !causalModelModified.getExogenousVariables().contains(l.variable()))
+-					.collect(Collectors.toSet());
+-
+-			Set<Literal> newW = new HashSet<>();
+-			for (Literal wCandidate : wCandidates) {
+-				// create an assignment instance where the current wCandidate is removed
+-				Assignment assignmentNew = new Assignment(assignment.literals().stream()
+-						.filter(l -> !l.variable().equals(wCandidate.variable())).collect(Collectors.toSet()));
+-				// compute the value of the current wCandidate using its equation
+-				boolean value = variableEquationMap.get(wCandidate.variable()).getFormula().evaluate(assignmentNew);
+-				/*
+-				 * if the value of the satisfying assignment and the value computed from the equation are
+-				 * different, than we know that the current variable needs to be in W, since we need to keep it to
+-				 * its original value such that the formula can be satisfied. */
+-				if (value != wCandidate.phase()) {
+-					newW.add(wCandidate);
+-				}
+-			}
+-
+-			if (newW.size() == 1) {
+-				// if we have found a W of size 1, it cannot get smaller and we can directly return it
+-				return newW;
+-			} else if (w == null || newW.size() < w.size()) {
+-				// update W only if it has not been set so far or if we have found a smaller W
+-				w = newW;
+-			}
+-		}
+-
+-		return w;
+-	}
+-
+-	/**
+-	 * Generates a formula whose satisfiability indicates whether AC2 is fulfilled or not.
+-	 *
+-	 * @param causalModel the causal model
+-	 * @param notPhi      the negated phi
+-	 * @param cause       the cause
+-	 * @param context     the context
+-	 * @param evaluation  the original evaluation under the given context
+-	 * @param ac3         set to true if used within AC3 check
+-	 * @param f           a formula factory
+-	 * @return a formula
+-	 */
+-	private Formula generateSATQuery(CausalModel causalModel, Formula notPhi, Set<Literal> cause,
+-			Set<Literal> context, Set<Literal> evaluation, SolvingStrategy solvingStrategy,
+-			boolean ac3, FormulaFactory f) {
+-		// get all variables in cause
+-		Set<Variable> causeVariables = cause.stream().map(Literal::variable).collect(Collectors.toSet());
+-		// create map of variables and corresponding evaluation
+-		Map<Variable, Literal> variableEvaluationMap = evaluation.stream()
+-				.collect(Collectors.toMap(Literal::variable, Function.identity()));
+-		// create formula: !phi AND context
+-		Formula formula = f.and(notPhi, f.and(context));
+-
+-		Set<Variable> wVariablesOptimized = null;
+-		if (solvingStrategy == SAT_OPTIMIZED_W || solvingStrategy == SAT_OPTIMIZED_W_MINIMAL) {
+-			wVariablesOptimized = CausalitySolver.getMinimalWVariables(causalModel, notPhi, cause, f);
+-		}
+-		Set<Variable> variablesAffectingPhi = null;
+-		if (solvingStrategy == SAT_OPTIMIZED_FORMULAS || solvingStrategy == SAT_OPTIMIZED_FORMULAS_MINIMAL) {
+-			variablesAffectingPhi = CausalitySolver.getReachableVariables(causalModel.getGraphReversed(),
+-					notPhi.literals(), f);
+-		}
+-
+-		for (Equation equation : causalModel.getVariableEquationMap().values()) {
+-			// get value of variable in original iteration
+-			Literal originalValue = variableEvaluationMap.get(equation.getVariable());
+-			Formula equationFormula;
+-			/*
+-			 * When generating a SAT query for AC3, then for each variable not in the cause, we stick to the same
+-			 * scheme as for AC2, i.e. (V_originalValue OR (V <=> Formula_V)).
+-			 *
+-			 * OPTIMZED_W Strategy: if the variable of the current equation is in the cause or not in the set of
+-			 * optimized variables, then we do not allow for its original value and just add (V <=> Formula_V).
+-			 *
+-			 * OPTIMIZED_CLAUSES Strategy: if the variable of the current equation is in the cause or not in the
+-			 * set of variables that affect phi, we just add TRUE to the formula*/
+-			if (!causeVariables.contains(equation.getVariable()) &&
+-					((solvingStrategy == SAT_OPTIMIZED_W || solvingStrategy == SAT_OPTIMIZED_W_MINIMAL) &&
+-							!wVariablesOptimized.contains(equation.getVariable()))) {
+-				equationFormula = f.equivalence(equation.getVariable(), equation.getFormula());
+-			} else if (!causeVariables.contains(equation.getVariable()) &&
+-					(solvingStrategy == SAT_OPTIMIZED_FORMULAS || solvingStrategy == SAT_OPTIMIZED_FORMULAS_MINIMAL)
+-					&& !variablesAffectingPhi.contains(equation.getVariable())) {
+-				equationFormula = f.verum();
+-			} else if (!causeVariables.contains(equation.getVariable())) {
+-				equationFormula = f.or(originalValue, f.equivalence(equation.getVariable(), equation.getFormula()));
+-			}
+-			/*
+-			 * If however the variable of the current equation in in the cause, we additionally add an OR with its
+-			 * negation. That is, we allow its original value, the negation of this original value and the
+-			 * equivalence with its equation. The resulting formula would be
+-			 * (V_originalValue OR (V <=> Formula_V) OR not(V_originalValue)). Obviously, we could replace that
+-			 * with TRUE or at least simplify it to (V_originalValue OR not(V_originalValue)). However, when
+-			 * replacing it by TRUE, we might run into the problem that some variables are removed completely
+-			 * from the formula which causes problem with the evaluation of some equations later on.
+-			 * Therefore, we want to keep at least (V_originalValue OR not(V_originalValue)). Unfortunately,
+-			 * LogicNG automatically replaces this formula by TRUE. To avoid this, we introduce a dummy variable
+-			 * as follows: (V_originalValue OR (not(V_originalValue) AND dummy))
+-			 * The dummy variable has no effect on the final result. */
+-			else {
+-				equationFormula = f.or(originalValue, originalValue.negate());
+-			}
+-			// add created formula to global formula by AND
+-			formula = f.and(formula, equationFormula);
+-		}
+-		return formula;
+-	}
+-
+-
+-
+-	/** This function prepares the ILP program based on the cm and the sat formula
+-	 * Then solves the model using Groupi solver. 
+-	 * Lastly, interpret the reults to return two sets one for the minimal cause and one for the non minimal w
+-	 * AC2 and AC3 results are not directly returned, but they can be infered from minimal cause set (size >1 AC2 is satisfied, == cause.size ac3 is satisfied)
+-	 * @param cm
+-	 * @param phi
+-	 * @param satFormula
+-	 * @param cause
+-	 * @param evaluation
+-	 * @return: a pair, the first element is the minimal cause, the second is the non minimal w
+-	 * @throws ParserException
+-	 * @throws GRBException
+-	 * @throws InvalidCausalModelException
+-	 */
+-	public Pair<Set<Literal>, Set<Literal>>  solveILP(FormulaFactory f, CausalModel cm, Formula phi, Formula satFormula, Set<Literal> cause,  Set<Literal> evaluation ) throws ParserException, GRBException, InvalidCausalModelException {
+-		//		printProblem(satFormula, cause, evaluation);
+-		Pair<Set<Literal>, Boolean> result;
+-		// create and configure the ilp vars
+-		//copy the variables of the causal model to ILP model
+-		GRBModel model = createGRBModel(cm, cause.size());
+-//		to find more solutions uncomment the following (TODO keep as an different solving strategy)
+-//		 use systematic search to find kth best solutions
+-//		model.set(GRB.IntParam.PoolSearchMode, 2);
+-//		// k is defined here:
+-//		model.set(GRB.IntParam.PoolSolutions, 5);
+-//		// don't look for any solution with objective value other than the optimal (Gap =0)
+-//		model.set(GRB.DoubleParam.PoolGap,0);	
+-		Set<Literal> minimalCause = new HashSet<>();
+-		Set<Literal> w = new HashSet<>();
+-		//add the constraints based on the formula
+-		addLPConstraints(f, satFormula, model, evaluation, cause);
+-		// write the model to file for debugging (should be stopped in benchmarks)
+-		model.write("./ILP-models/ptest"+cm.getName()+".lp");
+-		// solve the  model
+-		model.optimize();
+-		// Feasibility means that there is x or a subset of it satisfy AC2 and AC3. We don't know anything about W yet
+-		// to interpret the result; 1- it should be solved (status should be not 3, not sure if there are other statuses than 2 optimal http://www.gurobi.com/documentation/8.0/refman/optimization_status_codes.html)
+-		// 2- conclude the satisfying part of x
+-		// 3- conclude the required W
+-		// 4- would W really be correct
+-		/**
+-		 * G Formula contains: not Phi, context, equivalence or fixed value, no restrictions on x vector values but one should be different
+-		 * Then we find a solution that minimizes the delta d
+-		 * An optimal solution will allow us to conclude:
+-		 *  - Feasibility means x or a subset of x (size d) fulfills ac2 {not phi, some W} and fulfills ac3 (if optimal)
+-		 *  - to determine minimal x, we choose the parts in the solution that are different than actual values  
+-		 *  - to determine W in that solution we take all vars (not in x) which values stayed the same, this is not a minimal w
+-		 *  - for a minimal w, add another objective variable 'fixed_size' fs, we need to minimize it, and it can be zero
+-		 *  - TODO: minimal w, we need to use the actual world values and the flipped world values to influence W. However this raises the issue of weather minimal x plays a role.
+-		 **/
+-		// status codes: http://www.gurobi.com/documentation/8.0/refman/optimization_status_codes.html
+-		// 	OPTIMAL	2	Model was solved to optimality (subject to tolerances), and an optimal solution is available.
+-		//INFEASIBLE	3	Model was proven to be infeasible.
+-		if (model.get(GRB.IntAttr.Status) == GRB.INFEASIBLE) {
+-			System.out.println ("Model is infeasible.");
+-			minimalCause = null;
+-			w=null;
+-		}else if ( model.get(GRB.IntAttr.Status) == GRB.OPTIMAL) {
+-			System.out.println("Solution found, distance value = "+ model .get(GRB.DoubleAttr.ObjVal)+" status= "+ model.get(GRB.IntAttr.Status));
+-//	[optional]		int nSolutions = model.get(GRB.IntAttr.SolCount);
+-			GRBVar[] fvars = model.getVars();
+-			double[] x = model.get(GRB.DoubleAttr.X, fvars);
+-			String[] vnames = model.get(GRB.StringAttr.VarName, fvars);
+-//		[optional]	for (int e = 0; e < nSolutions; e++) {
+-			//TODO should fix the cause at each loop; for now i am writing the last cause
+-//			[optional]			minimalCause = new HashSet<>();
+-//			[optional]			w = new HashSet<>();					
+-//			model.set(GRB.IntParam.SolutionNumber, e);
+-//			System.out.println(model.get(GRB.IntAttr.SolCount)+ "Solution found, distance value = "+ model .get(GRB.DoubleAttr.ObjVal)+" status= "+ model.get(GRB.IntAttr.Status));				
+-			// use Xn when quering the nth solution
+-//			[optional]			double[] x = model.get(GRB.DoubleAttr.Xn, fvars);		
+-			//by only the distance value "res" we can judge ac3 and conclude that this is a cause or not. so we can have impls that return from here.
+-			// interpret the solution
+-			for (int j = 0; j < fvars.length; j++) {
+-				String varName = vnames[j];
+-				if (cause.stream().anyMatch(element -> element.name().equals(varName))) { // a solution value for a cause
+-					System.out.println(varName+" is part of the cause set");
+-					// get the variable literal in the original evaluation 
+-					Literal partialCause = evaluation.stream().filter(l -> l.name().equals(varName)).findAny().get();
+-					if (partialCause.phase() != (x[j] == 1.0)) {// then this part of the cause is  flipped TODO maybe exclude the ST SH here
+-						System.out.println("Partial cause found "+ varName +" actual value is "+partialCause.phase() +" solved value "+ x[j] );
+-						minimalCause.add(partialCause);
+-					} 	else{
+-						//TODO should we add those as W as an over-approximation 
+-						w.add(partialCause.variable());
+-//						System.out.println("Model was solved without flipping "+ varName +" actual value is "+partialCause.phase() +" solved value "+ x[j]+". violation of ac3." );
+-					}
+-					continue;
+-				}
+-				else if (phi.containsVariable(vnames[j])){// is from the effect variables
+-					continue;
+-				}
+-				else if (cm.getExogenousVariables().stream().filter(l->l.name().equals(varName)).findAny().isPresent()){// exo variable
+-					continue;
+-				}
+-				else {// last group of vars, unkown and possible W
+-					// get the variable literal in the original evaluation 
+-					Literal potentialWmember = evaluation.stream().filter(l -> l.name().equals(varName)).findAny()
+-							.orElse(null);
+-					if (potentialWmember==null){// this one of the vars added to the ILP e.g.res
+-						continue;
+-					}
+-					if ( potentialWmember.phase() == (x[j] == 1.0)) {// value stayed the same
+-//						System.out.println("W memeber found "+ varName +" actual value is "+potentialWmember.phase() +" solved value "+ x[j] );
+-						w.add(potentialWmember.variable());
+-					} 	
+-					continue;
+-				}
+-			}
+-		}
+-		//}
+-			else{
+-			System.out.println("Unhandled ILP status "+ model.get(GRB.IntAttr.Status) +" check ILP log" );
+-			minimalCause = null;
+-			w=null;
+-		}
+-	
+-		// Dispose of model and environment
+-		model.dispose();
+-		model.getEnv().dispose();
+-
+-		return new Pair<>(minimalCause, w); 
+-	}
+-
+-
+-
+-	private void printProblem(Formula satFormula, Set<Literal> cause, Set<Literal> evaluation) {
+-		System.out.println("SATFormula*****"+satFormula);	
+-		cause.forEach(c -> System.out.println(c.name()+""+c.phase()));
+-		System.out.println("evaluation");
+-		evaluation.forEach(c -> System.out.println(c.name()+""+c.phase()));
+-	}
+-
+-	/**
+-	 * a function that turns a custom causal model to Gurobi causal model the
+-	 * location should be changed to inside the causal model for example 
+-	 * 
+-	 * @param cm
+-	 * @param model
+-	 */
+-	public GRBModel createGRBModel(CausalModel cm, int causeSize) throws GRBException {
+-		// basic GRB model, parameters of the model should be set here
+-		GRBEnv env = new GRBEnv("./ILP-LOG/"+cm.getName()+".log");
+-		GRBModel model = new GRBModel(env);
+-
+-		// start with exo vars
+-		cm.getExogenousVariables().forEach(item -> {
+-			try {
+-				model.addVar(0.0, 1.0, 0.0, GRB.BINARY, item.name());
+-
+-			} catch (GRBException e) {
+-				e.printStackTrace();
+-			}
+-		});
+-
+-		cm.getEquationsSorted().forEach(e -> {
+-			try {
+-				model.addVar(0.0, 1.0, 0.0, GRB.BINARY, e.getVariable().name());
+-			} catch (GRBException e1) {
+-				e1.printStackTrace();
+-			}
+-		});
+-
+-
+-		model.addVar(1.0, causeSize, 0.0, GRB.INTEGER, DISTANCE_VAR_NAME);
+-
+-		// Apparently should call this method so that the model is in sync
+-		model.update();
+-		return model;
+-
+-	}
+-
+-	/**
+-	 * a function that converts CNF clauses to GRB constraints
+-	 * 
+-	 * @param fm
+-	 * @param model
+-	 */
+-	public void addLPConstraints(FormulaFactory f, Formula satFormula, GRBModel model, Set<Literal> evaluation, Set<Literal> cause) throws GRBException {
+-
+-		// Set objective: min res
+-		GRBLinExpr expr = new GRBLinExpr();
+-		expr.addTerm(1.0, model.getVarByName(DISTANCE_VAR_NAME));
+-		model.setObjective(expr, GRB.MINIMIZE);
+-
+-
+-		// add constraints to the ILP model based on the CNF clauses
+-		// this formula doesn't contain any constraint about the cause 
+-		
+-		CNFEncoder encoder = new CNFEncoder(f, new CNFConfig.Builder().algorithm(CNFConfig.Algorithm.FACTORIZATION).build());
+-	    Formula phi1CNF = encoder.encode(satFormula);
+-		
+-		Iterator<Formula> iter = phi1CNF.iterator();
+-		while (iter.hasNext()) {
+-			// one clause in the cnf
+-			Formula clause = iter.next();
+-			if (clause.isAtomicFormula()) { // Assignment mainly for the effect and the context
+-				// R118: BS = 0
+-				Literal literal = (Literal) clause;
+-				expr = new GRBLinExpr();
+-				expr.addTerm(1.0, model.getVarByName(literal.name()));
+-				model.addConstr(expr, GRB.EQUAL, literal.phase() ? 1.0 : 0.0, "R_" + literal.name());
+-			} else {
+-				Iterator<Formula> literals = clause.iterator();
+-				expr = new GRBLinExpr();
+-				while (literals.hasNext()) {
+-					Literal literal = (Literal) literals.next();
+-					if (literal.phase()) {
+-						expr.addTerm(1.0, model.getVarByName(literal.name()));
+-					} else {
+-						expr.addTerm(-1.0, model.getVarByName(literal.name()));
+-						expr.addConstant(1.0);
+-					}
+-				}
+-				model.addConstr(expr, GRB.GREATER_EQUAL, 1.0, "R_" + clause.toString());
+-			}
+-
+-		}
+-
+-		// Add the constraint of the distance
+-		// res = segma Di Di = {1-x xact = 1 x xact=0}
+-		// Rres: res = 1- BT + 1- XT {BTact,XTact=1}
+-		expr = new GRBLinExpr();
+-		// and their actual values
+-		Iterator<Literal> causesItr = evaluation.stream().filter(l->cause.contains(l)).iterator();
+-		while (causesItr.hasNext()) {
+-			// not sure weather this has the value or should we reuse the evaluation
+-			Literal literal = causesItr.next();
+-			if (literal.phase()) {
+-				expr.addConstant(1.0);
+-				expr.addTerm(-1.0, model.getVarByName(literal.name()));
+-			} else {
+-				expr.addTerm(1.0, model.getVarByName(literal.name()));
+-			}
+-		}
+-		model.addConstr(model.getVarByName(DISTANCE_VAR_NAME), GRB.EQUAL, expr, "R_result");
+-
+-	}
++    @Override
++    CausalitySolverResult solve(CausalModel causalModel, Set<Literal> context, Formula phi,
++                                Set<Literal> cause, SolvingStrategy solvingStrategy)
++            throws InvalidCausalModelException {
++        throw new UnsupportedOperationException("ILP solver requires Gurobi (unavailable)");
++    }
+ }
+diff --git a/src/main/java/de/tum/in/i4/hp2sat/causality/NumericCausalitySolver.java b/src/main/java/de/tum/in/i4/hp2sat/causality/NumericCausalitySolver.java
+index 1310a5f..860429f 100644
+--- a/src/main/java/de/tum/in/i4/hp2sat/causality/NumericCausalitySolver.java
++++ b/src/main/java/de/tum/in/i4/hp2sat/causality/NumericCausalitySolver.java
+@@ -1,705 +1,15 @@
+ package de.tum.in.i4.hp2sat.causality;
+ 
+ import de.tum.in.i4.hp2sat.exceptions.InvalidCausalModelException;
+-import gurobi.GRB;
+-import gurobi.GRBEnv;
+-import gurobi.GRBException;
+-import gurobi.GRBLinExpr;
+-import gurobi.GRBModel;
+-import gurobi.GRBVar;
+-
+ import org.logicng.formulas.Formula;
+ import org.logicng.formulas.Literal;
+-import org.logicng.io.parsers.ParserException;
+-import org.logicng.util.Pair;
+-import org.mariuszgromada.math.mxparser.Argument;
+-import org.mariuszgromada.math.mxparser.Expression;
+-import org.mariuszgromada.math.mxparser.NumericCausalModel;
+-import org.mariuszgromada.math.mxparser.parsertokens.BinaryRelation;
+-import org.mariuszgromada.math.mxparser.parsertokens.Operator;
+-import org.mariuszgromada.math.mxparser.parsertokens.ParserSymbol;
+-import org.mariuszgromada.math.mxparser.parsertokens.Token;
+-
+-import java.util.*;
++import java.util.Set;
+ 
+-import static de.tum.in.i4.hp2sat.causality.ILPSolverType.GUROBI;
+-//TODO fix the generality of CausalitySolver
+ public class NumericCausalitySolver extends CausalitySolver {
+-	private static final String DISTANCE_VAR_NAME = "res";
+-	private static final String IND_1_PREFIX = "IND1_";
+-	private static final String IND_2_PREFIX = "IND2_";
+-	private static final String SLACK_1_PREFIX = "SLA1_";
+-	private static final String SLACK_2_PREFIX = "SLA2_";
+-	private static final String DELTA_PREFIX = "DEL_";
+-	private static final String ABS_PREFIX = "ABS_";
+-	private static final String MIN_PREFIX = "MIN_";
+-	private  Double DEFAULT_BIG_M= 1000000000.0;
+-	private  Double DEFAULT_UPPER_BOUND =  100000000.0;
+-	private  Double DEFAULT_LOWER_BOUND = -100000000.0;
+-	
+-
+-	/**
+-	 * Overrides {@link CausalitySolver#solve(CausalModel, Set, Formula, Set, SolvingStrategy)}.
+-	 * Default SATSolver: MINISAT
+-	 *
+-	 * @param causalModel     the underlying causal model
+-	 * @param context         the context
+-	 * @param phi             the phi
+-	 * @param cause           the cause
+-	 * @param solvingStrategy the applied solving strategy
+-	 * @return for each AC, true if fulfilled, false else
+-	 * @throws InvalidCausalModelException thrown if internally generated causal models are invalid
+-	 */
+-	@Override
+-	CausalitySolverResult solve(CausalModel causalModel, Set<Literal> context, Formula phi, Set<Literal> cause,
+-			SolvingStrategy solvingStrategy) throws InvalidCausalModelException {
+-		throw new UnsupportedOperationException("should be changed in the interface, for now use the other solve function");
+-	}
+-
+-	
+-	
+-	public CausalitySolverResult solve(NumericCausalModel causalModel,  Map<String, Double> context, Expression phi, Set<Argument> cause,
+-			SolvingStrategy solvingStrategy) throws InvalidCausalModelException, GRBException {
+-		return solve(causalModel, context, phi, cause, solvingStrategy, GUROBI);
+-	}
+-
+-	
+-	
+-	/**
+-	 * Checks AC1, AC2 and AC3 given a causal model, a cause, a context and phi and a solving strategy.
+-	 *
+-	 * @param causalModel     the underlying causal model
+-	 * @param context         the context
+-	 * @param phi             the phi
+-	 * @param cause           the cause
+-	 * @param solvingStrategy the applied solving strategy
+-	 * @param satSolverType   the to be used SAT solver
+-	 * @return for each AC, true if fulfilled, false else
+-	 * @throws InvalidCausalModelException thrown if internally generated causal models are invalid
+-	 * @throws GRBException 
+-	 */
+-	CausalitySolverResult solve(NumericCausalModel causalModel, Map<String, Double> context, Expression phi,
+-			Set<Argument> cause, SolvingStrategy solvingStrategy, ILPSolverType solverType)
+-					throws InvalidCausalModelException, GRBException {
+-		// set the values of the exo arguments
+-		setContext(causalModel, context);
+-		Pair<Boolean, Boolean> ac1Tuple = fulfillsAC1(causalModel, phi, cause);
+-		boolean ac1 = ac1Tuple.first() && ac1Tuple.second();
+-		boolean ac2 = false,ac3=false;
+-		Set<Argument> w ;
+-		Set<Argument> minimalCause ;
+-		// in ILP we want to check the two conditions in one-go
+-		Pair<Set<Argument>, Set<Argument>> ac2ac3 = fulfillsAC2AC3(causalModel, phi, cause,  solvingStrategy, solverType);
+-
+-		minimalCause = ac2ac3.first();
+-		w = ac2ac3.second();
+-
+-		if ( minimalCause!=null ){
+-			if (minimalCause.isEmpty()){// means we did n't have to flip anything, couldn't happen because of minimum distance constraint
+-				ac2=ac3=false;
+-				System.out.println("The effect is not at all affected by the cause");
+-			}
+-			else if (minimalCause.size() == cause.size()){// this means ac2 and ac3 are fulfilled 
+-				ac2=true;
+-				ac3=true;
+-				System.out.println("The cause is minimal and counterfactual.");
+-			}
+-			else // there is a more minimal cause
+-			{
+-				ac2 = true; // maybe this is a harsh conclusion 
+-				ac3 = false;
+-				System.out.println("There is a minimal subset of the cause, i.e,:"+ minimalCause);
+-			}
+-
+-		}else{ // for the sake of unit-testing
+-			minimalCause = cause;
+-			w= new HashSet<>();
+-			}
+-
+-		CausalitySolverResult<Argument> causalitySolverResult = new CausalitySolverResult(ac1, ac2, ac3, minimalCause, w);
+-		return causalitySolverResult;
+-	}
+-
+-
+-	private void setContext(NumericCausalModel causalModel, Map<String, Double> context ) {
+-		
+-		// loop the exo vars and set their values according to the input map;
+-		// this should work since the argument is a call by reference 
+-		causalModel.getExogenousVariables().stream().forEach(n-> { n.setArgumentValue(context.get(n.getArgumentName()));});
+-
+-	}
+-	
+-	
+-    Pair<Boolean, Boolean> fulfillsAC1(NumericCausalModel causalModel, Expression phi, Set<Argument> cause) {
+-//    	System.out.println(phi.calculate());
+-        boolean phiEvaluation = (phi.calculate() == 1.0)?  true: false;
+-        boolean causeEval= true;
+-        for (Argument argument : cause) {
+-        	// lookup by name the causal model variable
+-        	Argument modelVar = causalModel.getVariableEquationMap().get(argument.getArgumentName());
+-//        	System.out.println("cause equation "+modelVar.getArgumentExpressionString());
+-//        	System.out.println("input cause value "+argument.getArgumentValue());
+-			if (argument.getArgumentValue()!= modelVar.getArgumentValue())
+-				causeEval= false;
+-		}
+-        
+-//        System.out.println("AC1: Phi"+ phiEvaluation + " cause Evaluation "+causeEval);
+- 
+-        return new Pair<>(phiEvaluation, causeEval);
++    @Override
++    CausalitySolverResult solve(CausalModel causalModel, Set<Literal> context, Formula phi,
++                                Set<Literal> cause, SolvingStrategy solvingStrategy)
++            throws InvalidCausalModelException {
++        throw new UnsupportedOperationException("NumericCausalitySolver requires Gurobi (unavailable)");
+     }
+-
+-
+-
+-	/**
+-	 * Checks if AC2 and AC3 are fulfilled. Combined approach that takes advantage of synergies between the separate
+-	 * approaches.
+-	 *
+-	 * @param causalModel     the underlying causal model
+-	 * @param phi             the phi
+-	 * @param cause           the cause for which we check AC2
+-	 * @param context         the context
+-	 * @param evaluation      the original evaluation of variables
+-	 * @param solvingStrategy the solving strategy
+-	 * @param satSolverType   the to be used SAT solver
+-	 * @param f               a formula factory
+-	 * @return a tuple of set W and a boolean value indicating whether AC3 is fulfilled or not
+-	 * @throws InvalidCausalModelException thrown if internally generated causal models are invalid
+-	 * @throws GRBException 
+-	 */
+-	private Pair<Set<Argument>, Set<Argument>> fulfillsAC2AC3(NumericCausalModel causalModel, Expression phi, Set<Argument> cause,
+-			  SolvingStrategy solvingStrategy, ILPSolverType iLPSolverType) throws InvalidCausalModelException, GRBException {
+-		
+-		
+-		Pair<Set<Argument>, Set<Argument>> result;
+-		Set<String> phiNames = createListOfPhiNames(phi);
+-		// in this implementation we will not use a SAT formula
+-		//1. Generate the Gurobi model
+-		//create and configure the ilp parameters
+-		//create the ILP model vars and the auxiliary vars 
+-		GRBModel model = createGRBModel(causalModel, cause, phiNames);
+-		//add the constraints based on the formula
+-		addLPConstraints( model, causalModel, cause, phi);
+-		// write the model to file for debugging (should be stopped in benchmarks)
+-		model.write("./ILP-models/Numeric_"+causalModel.getName()+".lp");
+-		try {
+-			result = solveILP(model, causalModel,phi, cause);
+-		} catch (ParserException | GRBException e) {
+-			result= null;
+-			e.printStackTrace();
+-		}
+-
+-
+-		return result;
+-	}
+-
+-	private Set<String> createListOfPhiNames(Expression phi) {
+-		Set<String> names = new HashSet<>();
+-		for (int i = 0; i < phi.getArgumentsNumber(); i++) {
+-			names.add(phi.getArgument(i).getArgumentName());
+-		}
+-		
+-		return names;
+-	}
+-
+-
+-
+-
+-	/** This function  solves the model using Groupi solver. 
+-	 * Lastly, interpret the reults to return two sets one for the minimal cause and one for the non minimal w
+-	 * AC2 and AC3 results are not directly returned, but they can be infered from minimal cause set (size >1 AC2 is satisfied, == cause.size ac3 is satisfied)
+-	 * @param cm
+-	 * @param phi
+-	 * @param satFormula
+-	 * @param cause
+-	 * @param evaluation
+-	 * @return: a pair, the first element is the minimal cause, the second is the non minimal w
+-	 * @throws ParserException
+-	 * @throws GRBException
+-	 * @throws InvalidCausalModelException
+-	 */
+-	public Pair<Set<Argument>, Set<Argument>>  solveILP(GRBModel model, NumericCausalModel cm, Expression phi, Set<Argument> cause ) throws ParserException, GRBException, InvalidCausalModelException {
+-		//	printProblem(satFormula, cause, evaluation);
+-	
+-		Set<Argument> minimalCause = new HashSet<>();
+-		Set<Argument> w = new HashSet<>();
+-		
+-		// solve the  model
+-		model.optimize();
+-		/**
+-		 * not Phi, context, equivalence or fixed value, no restrictions on x vector values but one should be different
+-		 * Then we find a solution that minimizes the delta d
+-		 * An optimal solution will allow us to conclude:
+-		 *  - Feasibility means x or a subset of x (size d if the vars are integers) fulfills ac2 {not phi, some W} and fulfills ac3 (if optimal)
+-		 *  - to determine minimal x, we choose the parts in the solution that are different than actual values  
+-		 *  - to determine W in that solution we take all vars (not in x) which values stayed the same, this is not a minimal w
+-		 *  - for a minimal w, add another objective variable 'fixed_size' fs, we need to minimize it, and it can be zero
+-		 *  - TODO: minimal w, we need to use the actual world values and the flipped world values to influence W. However this raises the issue of weather minimal x plays a role.
+-		 **/
+-		// status codes: http://www.gurobi.com/documentation/8.0/refman/optimization_status_codes.html
+-		// 	OPTIMAL	2	Model was solved to optimality (subject to tolerances), and an optimal solution is available.
+-		//INFEASIBLE	3	Model was proven to be infeasible.
+-		if (model.get(GRB.IntAttr.Status) == GRB.INFEASIBLE) {
+-			System.out.println ("Model is infeasible.");
+-			minimalCause = null;
+-			w=null;
+-		}else if ( model.get(GRB.IntAttr.Status) == GRB.OPTIMAL) {
+-			int nSolutions = model.get(GRB.IntAttr.SolCount);
+-			GRBVar[] fvars = model.getVars();
+-			String[] vnames = model.get(GRB.StringAttr.VarName, fvars);
+-//			for (int e = 0; e < nSolutions; e++) {
+-			minimalCause = new HashSet<>();
+-			w = new HashSet<>();
+-//			model.set(GRB.IntParam.SolutionNumber, e);
+-			System.out.println(model.get(GRB.IntAttr.SolCount)+ "Solution found, distance value = "+ model .get(GRB.DoubleAttr.ObjVal)+" status= "+ model.get(GRB.IntAttr.Status));
+-				
+-			// use Xn when quering the nth solution
+-			double[] x = model.get(GRB.DoubleAttr.X, fvars);
+-			
+-			//by only the distance value "res" we can judge ac3 and conclude that this is a cause or not. so we can have impls that return from here.
+-			// interpret the solution
+-			for (int j = 0; j < fvars.length; j++) {
+-				String varName = vnames[j];
+-				if (cause.stream().anyMatch(element -> element.getArgumentName().equals(varName))) { // a solution value for a cause
+-					System.out.println(varName+" is part of the cause set");
+-					// get the variable in the original evaluation 
+-					Argument partialCause = cause.stream().filter(l -> l.getArgumentName().equals(varName)).findAny().get();
+-					if (partialCause.getArgumentValue() != x[j] ) {// then this part of the cause is  flipped
+-						System.out.println("Partial cause found "+ varName +" actual value is "+partialCause.getArgumentValue()+" solved value "+ x[j] );
+-						minimalCause.add(partialCause);
+-					} 	else{
+-						//TODO should we add those as W as an over-approximation 
+-						w.add(partialCause);
+-//						System.out.println("Model was solved without flipping "+ varName +" actual value is "+partialCause.phase() +" solved value "+ x[j]+". violation of ac3." );
+-					}
+-					continue;
+-				}
+-				else if (phi.getArgumentIndex(varName) != -1){// is from the effect variables
+-					continue;
+-				}
+-				else if (cm.getExogenousVariables().stream().filter(l->l.getArgumentName().equals(varName)).findAny().isPresent()){// exo variable
+-					continue;
+-				}
+-				else { 
+-					// last group of vars, unkown and possible W
+-					// get the variable literal in the original evaluation 
+-					Argument potentialWmember = cm.getEquationsSorted().stream().filter(l -> l.getArgumentName().equals(varName)).findAny()
+-							.orElse(null);
+-					if (potentialWmember==null){// could be auxiliary vars this one of the vars added to the ILP e.g.res
+-						continue;
+-					}
+-					// this could also be done by checking the auxilary vars value
+-					if ( potentialWmember.getArgumentValue() == x[j] ) {// value stayed the same
+-					//	System.out.println("W memeber found "+ varName +" actual value is "+potentialWmember.getArgumentValue()+" solved value "+ x[j] );
+-						w.add(potentialWmember);
+-					} 	
+-					continue;
+-				}
+-			}
+-		}
+-//		}
+-			else{
+-			System.out.println("Unhandled ILP status "+ model.get(GRB.IntAttr.Status) +" check ILP log" );
+-			minimalCause = null;
+-			w=null;
+-		}
+-
+-		
+-		
+-		// Dispose of model and environment
+-		model.dispose();
+-		model.getEnv().dispose();
+-
+-		return new Pair<>(minimalCause, w); 
+-	}
+-
+-
+-
+-	/**
+-	 * a function that turns a custom causal model to Gurobi causal model the
+-	 * adds the original, the auxiliary variables, and the constraints for the auxiliary variables (except the distance)
+-	 * 
+-	 * @param cm
+-	 * @param model
+-	 */
+-	public GRBModel createGRBModel(NumericCausalModel cm, Set<Argument> cause, Set<String> phiNames) throws GRBException {
+-		
+-		// basic GRB model, parameters of the model should be set here
+-		GRBEnv env = new GRBEnv("./Numeric-ILP-LOG/"+cm.getName()+".log");
+-		GRBModel model = new GRBModel(env);
+-
+-		// start with exo vars
+-		cm.getExogenousVariables().forEach(item -> {
+-			try {
+-				//TODO integer vars for now 
+-				model.addVar(DEFAULT_LOWER_BOUND, DEFAULT_UPPER_BOUND, 0.0, GRB.INTEGER, item.getArgumentName());
+-
+-			} catch (GRBException e) {
+-				e.printStackTrace();
+-			}
+-		});
+-		
+-		GRBLinExpr expr = new GRBLinExpr();
+-		GRBLinExpr causeExpr = new GRBLinExpr();
+-		cm.getEquationsSorted().forEach(e -> {
+-			try {
+-				//TODO bounds
+-				GRBVar variable = model.addVar(DEFAULT_LOWER_BOUND, DEFAULT_UPPER_BOUND, 0.0, GRB.INTEGER, e.getArgumentName());
+-				// for cause vars we add auxiliary variables for the distance calculation
+-				// res = segma Di Di = Min (1, Absolute (x-x')); 
+-				
+-				// namely delta = x - x' abs = abs (delta) min= min (1, abs) 
+-				//TODO how about continuous variables won't work with min 1
+-				
+-				if (cause.stream().anyMatch(x-> x.getArgumentName().equals(e.getArgumentName()))) {
+-					System.out.println(e.getArgumentName()+" is a cause var");
+-					// TODO bounds
+-					GRBVar delta = model.addVar(DEFAULT_LOWER_BOUND, DEFAULT_UPPER_BOUND, 0.0, GRB.INTEGER, DELTA_PREFIX + e.getArgumentName());
+-					GRBVar abs = model.addVar(DEFAULT_LOWER_BOUND, DEFAULT_UPPER_BOUND, 0.0, GRB.INTEGER, ABS_PREFIX + e.getArgumentName());
+-					// TODO Binary ?
+-					GRBVar min = model.addVar(0.0, 1.00, 0.0, GRB.BINARY, MIN_PREFIX + e.getArgumentName());
+-					
+-					// Add the constraints of the distance
+-					// the delta equation
+-					expr.addTerm(1.0,variable);
+-					expr.addConstant(- e.getArgumentValue());
+-					model.addConstr(delta, GRB.EQUAL, expr, "delta_"+e.getArgumentName());
+-					expr.clear();
+-					// abs = abs(delta)  addGenConstrAbs(y, x)
+-					model.addGenConstrAbs(abs, delta, "abs_"+e.getArgumentName());
+-					model.addGenConstrMin(min, new GRBVar[] {abs},1.0, "min_"+e.getArgumentName());
+-					
+-					// append to an expression for the sigma
+-					causeExpr.addTerm(1.0, min);
+-				}	// for vars not in the effect add 4 vars: 2 binary and 2 integer?
+-				else if (!phiNames.contains(e.getArgumentName())) {
+-//					System.out.println(e.getArgumentName()+" is a normal var");
+-					GRBVar indicator1 = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, IND_1_PREFIX + e.getArgumentName());
+-					GRBVar indicator2 = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, IND_2_PREFIX + e.getArgumentName());
+-					// TODO bounds are set based on default setting
+-					GRBVar slack1 = model.addVar(DEFAULT_LOWER_BOUND, DEFAULT_UPPER_BOUND, 0.0, GRB.INTEGER, SLACK_1_PREFIX + e.getArgumentName());
+-					GRBVar slack2 = model.addVar(DEFAULT_LOWER_BOUND, DEFAULT_UPPER_BOUND, 0.0, GRB.INTEGER, SLACK_2_PREFIX + e.getArgumentName());
+-					// does this work here after adding the vars directly
+-					// add the constraints of the auxiliary vars
+-					//wk ≤ M(1− y)  --> M - My 			
+-					expr.addConstant(DEFAULT_BIG_M);
+-					expr.addTerm(-DEFAULT_BIG_M, indicator1);
+-					model.addConstr(slack1, GRB.LESS_EQUAL, expr, "SLACK_11_"+ e.getArgumentName());
+-					expr.clear();
+-					//wk ≥ −M(1− y)--> -M + My
+-					expr.addConstant(-DEFAULT_BIG_M);
+-					expr.addTerm(DEFAULT_BIG_M, indicator1);
+-					model.addConstr(slack1, GRB.GREATER_EQUAL, expr, "SLACK_12_"+ e.getArgumentName());
+-					expr.clear();
+-
+-					// slack and indictaor two 
+-					//w2 ≤ M(1− y)  --> M - My 			
+-					expr.addConstant(DEFAULT_BIG_M);
+-					expr.addTerm(-DEFAULT_BIG_M, indicator2);
+-					model.addConstr(slack2, GRB.LESS_EQUAL, expr, "SLACK_21_"+ e.getArgumentName());
+-					expr.clear();
+-					//wk ≥ −M(1− y)--> -M + My
+-					expr.addConstant(-DEFAULT_BIG_M);
+-					expr.addTerm(DEFAULT_BIG_M, indicator2);
+-					model.addConstr(slack2, GRB.GREATER_EQUAL, expr, "SLACK_22_"+ e.getArgumentName());
+-					expr.clear();
+-					
+-					
+-					// connect the two indicators with a constraint 
+-					expr.addTerm(1, indicator1);
+-					expr.addTerm(1, indicator2);
+-					model.addConstr(expr, GRB.GREATER_EQUAL, 1.0, "Indicators_"+ e.getArgumentName());
+-					expr.clear();
+-				}
+-				expr.clear();
+-			} catch (GRBException e1) {
+-				e1.printStackTrace();
+-			}
+-		});
+-		
+-		//1. distance = segma
+-		GRBVar distance = model.addVar(1.0, cause.size(), 0.0, GRB.INTEGER, DISTANCE_VAR_NAME);
+-		model.addConstr(distance, GRB.EQUAL, causeExpr, "R_result");
+-		
+-		// options for the solving
+-		// TODO keep as a different solving strategy
+-		// use systematic search to find kth best solutions
+-		model.set(GRB.IntParam.PoolSearchMode, 2);
+-		// k is defined here:
+-		model.set(GRB.IntParam.PoolSolutions, 5);
+-		// don't look for any solution with objective value other than the optimal (Gap =0)
+-		model.set(GRB.DoubleParam.PoolGap,0);
+-		
+-		// Apparently should call this method so that the model is in sync
+-		model.update();
+-		return model;
+-
+-	}
+-
+-	
+-	/**
+-	 * a function that converts CNF clauses to GRB constraints
+-	 * 
+-	 * @param fm
+-	 * @param model
+-	 */
+-	public void addLPConstraints(GRBModel model, NumericCausalModel cm, Set<Argument> cause, Expression phi) throws GRBException {
+-
+-	
+-		// add constraints to the ILP model based 
+-		// loop the model variables to add constraints
+-		//1. Exos: Ex1 = 5 --> Ex1 - 5 = 0
+-		//TODO we can add this as part of vars loop
+-		cm.getExogenousVariables().forEach(item -> {
+-			try {
+-				GRBLinExpr	exoExpr = new GRBLinExpr();
+-				exoExpr.addTerm(1.0, model.getVarByName(item.getArgumentName()));
+-				model.addConstr(exoExpr, GRB.EQUAL, item.getArgumentValue(), "EXO_" +item.getArgumentName() );
+-			} catch (GRBException e) {
+-				e.printStackTrace();
+-			}
+-		});
+-
+-		//3. Models equations 
+-		// loop all the endogenous variables
+-		Iterator<Argument> iter = cm.getEquationsSorted().iterator();
+-		while (iter.hasNext()) {
+-			Argument variable = iter.next();
+-			String varName = variable.getArgumentName();
+-			// ignore the variable if it is a cause var
+-			//TODO double check if this works as a reference comparison or should do a name lookup
+-			if (cause.stream().anyMatch(e-> e.getArgumentName().equals(variable.getArgumentName()))) {
+-				// we already added the distance, maybe can be done here instead
+-//				System.out.println(variable.getArgumentName()+ " is a cause being skipped");
+-				continue;
+-			}
+-			// effect variables formulas; we don't need the disjunctive constraint  
+-			if (phi.getArgumentIndex(varName)!= -1) { 
+-//				System.out.println(variable.getArgumentName()+ "is a phi var");
+-				addLinearEquality(variable, cm.getExpression(variable), model, false);
+-								
+-			} else {// Variables not in cause or effect 
+-//				System.out.println(variable.getArgumentName()+ " is a normal var");
+-				addLinearEquality(variable, cm.getExpression(variable), model, true);
+-			}
+-
+-		}
+-				
+-		//2. Effect: should be "negated", i.e., takes a different value 
+-		// we formalize this in a constraint as |PhiExpression - value|>0 e.g. X=4 --> |x-4|>0 or x-y=1 --> |x-y-1|>0
+-		addPhiNegation(phi,model);
+-		
+-		// Set objective: minimize res
+-		GRBLinExpr expr = new GRBLinExpr();
+-		expr.addTerm(1.0, model.getVarByName(DISTANCE_VAR_NAME));
+-		model.setObjective(expr, GRB.MINIMIZE);
+-		model.update();
+-	}
+-	
+-	
+-	// this function can be used for representing the linear equalities of variables. We use this 
+-	// for Phi vars and the disjunctive constraints
+-	// Examples OF fX in mind:  X + y +4 ;-x - y- 4;3*Y + 5*x -40; -3 *Y - 5*X + 40 ; 3 + Z; 400; y
+-	private  void addLinearEquality (Argument variable, Expression equation, GRBModel model, boolean addSlack) throws GRBException {
+-		// we need to turn the equation to the equality: Fx - V = 0 
+-		
+-		List<Token> tokens = equation.getCopyOfInitialTokens();
+-		// defaults
+-		Double currentCoefficient = 1.0;
+-		double sign = 1.0; // 1.0 or -1.0 
+-		GRBLinExpr expr = new GRBLinExpr();
+-		GRBVar currentArgument = null;
+-		for (int i = 0; i < tokens.size(); i++) {
+-			Token token = tokens.get(i);
+-			// loop the tokens if tokentypeid= 101 which is an argument; 
+-			// then get the Gurobi variable of this;
+-			// each term is an operator, coefficient, and an argument. A term could also be a constant 
+-			if (token.tokenTypeId == Argument.TYPE_ID) {
+-				currentArgument = model.getVarByName(token.tokenStr);
+-				// special cases:   we are at the end
+-				if ( i==tokens.size()-1) { 
+-//					System.out.println(i+" "+token.tokenStr+  " "+variable.getArgumentName());
+-					expr.addTerm(currentCoefficient*sign, currentArgument);
+-					currentArgument=null;
+-				}
+-				
+-			} else if (token.tokenTypeId == ParserSymbol.NUMBER_TYPE_ID) {
+-				// if it was type id = 0 then it is a 
+-				//number that can be a coefficient or a constant in an equation 
+-				currentCoefficient = token.tokenValue;
+-				if (i==tokens.size()-1) {// if this is the last element (number) could also work for the first
+-					expr.addConstant(currentCoefficient*sign);
+-				}
+-			}
+-			else if (token.tokenTypeId == Operator.TYPE_ID) {// + - * /...
+-				if ((token.tokenId == Operator.PLUS_ID) || (token.tokenId == Operator.MINUS_ID) ) {
+-					// when i get a +- not at the beginning i add the previous Term or constant, and use the operator as sign for next
+-					if ( i != 0 ) { 
+-						if (currentArgument!= null) {
+-							expr.addTerm(currentCoefficient*sign, currentArgument);
+-							}
+-						else if (currentCoefficient!=null) {
+-							expr.addConstant(currentCoefficient*sign);
+-						}
+-					}
+-					// set next term sign
+-					sign = (token.tokenId == Operator.PLUS_ID)? 1.0: -1.0;
+-					currentCoefficient= 1.0;
+-					currentArgument = null;
+-				}else {
+-
+-					// this is a *; should we do anything
+-				}
+-
+-			}
+-//			else if (token.NOT_MATCHED==1) { // TODO handle unmatched tokens
+-//
+-//			}
+-		}
+-		// The expression so far simulates Fx; Now Fx-V = 0 
+-		expr.addTerm(-1.0, model.getVarByName(variable.getArgumentName()));
+-		if (addSlack) {
+-			expr.addTerm(1.0, model.getVarByName(SLACK_1_PREFIX+variable.getArgumentName()));
+-			// the constraints of the slack and the indicator vars are already added; this would be another location to add them
+-			// Now lets add the second constraint to account fow W; V - v + w2 = 0
+-			GRBLinExpr contingencyExpression = new GRBLinExpr();
+-			contingencyExpression.addTerm(1, model.getVarByName(variable.getArgumentName()));
+-			contingencyExpression.addConstant(-variable.getArgumentValue());
+-			contingencyExpression.addTerm(1,model.getVarByName(SLACK_2_PREFIX+variable.getArgumentName()));
+-			
+-			model.addConstr(contingencyExpression, GRB.EQUAL, 0.0, "R_2_" +variable.getArgumentName());
+-		}
+-		// finalize the constraint and add it 
+-		model.addConstr(expr, GRB.EQUAL, 0.0, "R_" +variable.getArgumentName());
+-
+-	}
+-	
+-	// for now assume the phi expression is as x-4=0 if not the client of this function should convert it
+-	//e.g. x-y=1 --> x-y-1=0; x-5 != 0
+-		private  void addPhiNegation ( Expression equation, GRBModel model) throws GRBException {
+-			List<Token> tokens = equation.getCopyOfInitialTokens();
+-			Double currentCoefficient = 1.0;
+-			double sign = 1.0; // 1.0 or -1.0 
+-			GRBLinExpr expr = new GRBLinExpr();
+-			GRBVar currentArgument = null;
+-			boolean isContrastive= false;
+-			for (int i = 0; i < tokens.size(); i++) {
+-				Token token = tokens.get(i);
+-				// each term is an operator, coefficient, and an argument. A term could also be a constant 
+-				if (token.tokenTypeId == Argument.TYPE_ID) {
+-					currentArgument = model.getVarByName(token.tokenStr);
+-					if ( i==tokens.size()-3) { 
+-						expr.addTerm(currentCoefficient*sign, currentArgument);
+-						currentArgument=null;
+-					}
+-					
+-				} else if (token.tokenTypeId == ParserSymbol.NUMBER_TYPE_ID) {
+-					// if it was type id = 0 then it is a 
+-					//number that can be a coefficient or a constant in an equation 
+-					currentCoefficient = token.tokenValue;
+-					if (i==tokens.size()-3) {// if this is the last element (number) excluding = and 0
+-						expr.addConstant(currentCoefficient*sign);
+-					}
+-				}
+-				else if (token.tokenTypeId == Operator.TYPE_ID) {// + - * /...
+-					// if it was 1 then it is an operator 
+-					if ((token.tokenId == Operator.PLUS_ID) || (token.tokenId == Operator.MINUS_ID) ) {
+-						// when i get a +- not at the beginning i add the previous Term or constant, and use the operator as sign for next
+-						if ( i != 0 ) { 
+-							if (currentArgument!= null)
+-								expr.addTerm(currentCoefficient*sign, currentArgument);
+-							else if (currentCoefficient!=null)
+-								expr.addConstant(currentCoefficient*sign);
+-						}
+-						// set next term sign
+-						sign = (token.tokenId == Operator.PLUS_ID)? 1.0: -1.0;
+-						currentCoefficient= null;
+-						currentArgument = null;
+-					}else {
+-
+-						// this is a *; should we do anything
+-					}
+-
+-				}
+-				
+-				else if (token.tokenTypeId == BinaryRelation.TYPE_ID) {// =;!=
+-					// in case of not equal as a contrastive should be handled
+-					if ((token.tokenId == BinaryRelation.NEQ_ID)) {
+-					// this is a phi expression with an inequality != or ~=, so its contrastive
+-					// we do nothing but set a flag that should govern the expression operator 
+-						isContrastive =true; 
+-						System.out.println("contrastive");
+-						}
+-
+-				}
+-				
+-				else if (token.NOT_MATCHED==1) { // TODO handle unmatched tokens
+-
+-				}
+-				// there is also the = in this case; we are not handling because we assume x-8=0 format
+-			}
+-			
+-			//TODO Bounds
+-			GRBVar phi =  model.addVar(DEFAULT_LOWER_BOUND, DEFAULT_UPPER_BOUND, 0.0, GRB.INTEGER, "PHI");
+-			// Phi = X-4 assumed to equal 0
+-			model.addConstr(expr, GRB.EQUAL, phi, "R_PHI_value" );
+-			expr.clear();
+-			// PhiAbs = |phi|
+-			GRBVar phiAbs =  model.addVar(DEFAULT_LOWER_BOUND, DEFAULT_UPPER_BOUND, 0.0, GRB.INTEGER, "PHI_ABS");
+-			model.addGenConstrAbs(phiAbs, phi, "R_PHI_ABS");
+-			// PhiAbs>0
+-			//TODO for continuous vars maybe the delta is less than one 
+-			if (!isContrastive)
+-				model.addConstr(phiAbs, GRB.GREATER_EQUAL, 1.0, "R_PHI_intervention" );
+-			else // this is the case for contrastive query; phi is of the form y-4 != 0; its negation is y-4 =0
+-				model.addConstr(phiAbs, GRB.EQUAL, 0.0, "R_PHI_intervention" );
+-			// in summary for the effect we add two variables and 3 constraints
+-
+-		}
+-
+-
+-
+-		public double getDEFAULT_BIG_M() {
+-			return DEFAULT_BIG_M;
+-		}
+-
+-
+-
+-		public void setDEFAULT_BIG_M(double dEFAULT_BIG_M) {
+-			DEFAULT_BIG_M = dEFAULT_BIG_M;
+-		}
+-
+-
+-
+-		public Double getDEFAULT_UPPER_BOUND() {
+-			return DEFAULT_UPPER_BOUND;
+-		}
+-
+-
+-
+-		public void setDEFAULT_UPPER_BOUND(Double dEFAULT_UPPER_BOUND) {
+-			DEFAULT_UPPER_BOUND = dEFAULT_UPPER_BOUND;
+-		}
+-
+-
+-
+-		public Double getDEFAULT_LOWER_BOUND() {
+-			return DEFAULT_LOWER_BOUND;
+-		}
+-
+-
+-
+-		public void setDEFAULT_LOWER_BOUND(Double dEFAULT_LOWER_BOUND) {
+-			DEFAULT_LOWER_BOUND = dEFAULT_LOWER_BOUND;
+-		}
+-
+-
+-
+-		public NumericCausalitySolver(double dEFAULT_BIG_M, Double dEFAULT_UPPER_BOUND, Double dEFAULT_LOWER_BOUND) {
+-			super();
+-			DEFAULT_BIG_M = dEFAULT_BIG_M;
+-			DEFAULT_UPPER_BOUND = dEFAULT_UPPER_BOUND;
+-			DEFAULT_LOWER_BOUND = dEFAULT_LOWER_BOUND;
+-		}
+-		public NumericCausalitySolver() {
+-		}
+ }
+diff --git a/src/main/java/de/tum/in/i4/hp2sat/causality/NumericSolver.java b/src/main/java/de/tum/in/i4/hp2sat/causality/NumericSolver.java
+index 64a5da0..d16f715 100644
+--- a/src/main/java/de/tum/in/i4/hp2sat/causality/NumericSolver.java
++++ b/src/main/java/de/tum/in/i4/hp2sat/causality/NumericSolver.java
+@@ -1,471 +1,15 @@
+ package de.tum.in.i4.hp2sat.causality;
+ 
+ import de.tum.in.i4.hp2sat.exceptions.InvalidCausalModelException;
+-import gurobi.GRB;
+-import gurobi.GRBEnv;
+-import gurobi.GRBException;
+-import gurobi.GRBLinExpr;
+-import gurobi.GRBModel;
+-import gurobi.GRBVar;
+-
+ import org.logicng.formulas.Formula;
+-import org.logicng.formulas.FormulaFactory;
+ import org.logicng.formulas.Literal;
+-import org.logicng.formulas.Variable;
+-import org.logicng.io.parsers.ParserException;
+-import org.logicng.util.Pair;
+-
+-import java.util.*;
+-import java.util.function.Function;
+-import java.util.stream.Collectors;
++import java.util.Set;
+ 
+-
+-// this is for ilp why numeric
+ class NumericSolver extends CausalitySolver {
+-	static final String C1_VAR_PREFIX = "C1_";
+-	static final String C2_VAR_PREFIX = "C2_";
+-	static final String C3_VAR_PREFIX = "C3_";
+-	static final String C1_SUM_VAR = C1_VAR_PREFIX + "sum";
+-	static final String C1COM_SUM_VAR = C1_VAR_PREFIX + "com_sum";
+-	static final String C3_SUM_VAR = C3_VAR_PREFIX + "sum";
+-	
+-	
+-	
+-
+-	@Override
+-	CausalitySolverResult solve(CausalModel causalModel, Set<Literal> context, Formula phi, Set<Literal> cause,
+-			SolvingStrategy solvingStrategy) throws InvalidCausalModelException {
+-		// TODO Auto-generated method stub
+-		return null;
+-	}
+-
+-	/**
+-	 * {@link CausalitySolver#solve(CausalModel, Set, Formula, Set, SolvingStrategy)}.
+-	 * Default SATSolver: MINISAT
+-	 *
+-	 * @param causalModel     the underlying causal model
+-	 * @param context         the context
+-	 * @param phi             the phi
+-	 * @param solvingStrategy the applied solving strategy
+-	 * @return for each AC, true if fulfilled, false else
+-	 * @throws InvalidCausalModelException thrown if internally generated causal
+-	 *                                     models are invalid
+-	 */
+-	
+-	List<CausalitySolverResult> solveWhy(CausalModel causalModel, Set<Literal> context, Formula phi, Set<Literal> cause,
+-			SolvingStrategy solvingStrategy) throws InvalidCausalModelException {
+-		return solve(causalModel, context, phi);
+-	}
+-
+-	/**
+-	 * Checks AC1, AC2 and AC3 given a causal model, a cause, a context and phi and
+-	 * a solving strategy.
+-	 *
+-	 * @param causalModel the underlying causal model
+-	 * @param context     the context
+-	 * @param phi         the phi
+-	 * @return for each AC, true if fulfilled, false else
+-	 * @throws InvalidCausalModelException thrown if internally generated causal
+-	 *                                     models are invalid
+-	 */
+-	List<CausalitySolverResult> solve(CausalModel causalModel, Set<Literal> context, Formula phi)
+-			throws InvalidCausalModelException {
+-		FormulaFactory f = new FormulaFactory();
+-		Set<Literal> evaluation = CausalitySolver.evaluateEquations(causalModel, context);
+-
+-		List<Pair<Set<Literal>, Set<Literal>>> result = findCauses(causalModel, phi, context, evaluation, f);
+-		List<CausalitySolverResult> causes = new ArrayList<CausalitySolverResult>();
+-		if (result == null) {
+-			return causes;
+-		}
+-//		convert to results objects
+-		for (Pair<Set<Literal>, Set<Literal>> actualCause : result) {
+-			// TODO should we check ac1 after the results are obtained
+-			boolean ac2 = false, ac3 = false, ac1 = false;
+-			Set<Literal> w;
+-			Set<Literal> cause;
+-			// we want to find a possible cause with some criteria
+-
+-			cause = actualCause.first();
+-			w = actualCause.second();
+-
+-			if (cause != null) {
+-				if (cause.isEmpty()) {// means we did n't have to flip anything, couldn't happen because of minimum
+-										// distance constraint
+-					ac2 = ac3 = false;
+-					System.out.println("The effect is not at all affected by the cause");
+-				} else {
+-					ac1 = true;
+-					ac2 = true; // maybe this is a harsh conclusion
+-					ac3 = true;
+-				}
+-
+-			}
+-			CausalitySolverResult causalitySolverResult = new CausalitySolverResult(ac1, ac2, ac3, cause, w);
+-			causes.add(causalitySolverResult);
+-		}
+-		return causes;
+-	}
+-
+-	/**
+-	 * Checks if AC2 and AC3 are fulfilled. Combined approach that takes advantage
+-	 * of synergies between the separate approaches.
+-	 *
+-	 * @param causalModel     the underlying causal model
+-	 * @param phi             the phi
+-	 * @param cause           the cause for which we check AC2
+-	 * @param context         the context
+-	 * @param evaluation      the original evaluation of variables
+-	 * @param solvingStrategy the solving strategy
+-	 * @param satSolverType   the to be used SAT solver
+-	 * @param f               a formula factory
+-	 * @return a tuple of set W and a boolean value indicating whether AC3 is
+-	 *         fulfilled or not
+-	 * @throws InvalidCausalModelException thrown if internally generated causal
+-	 *                                     models are invalid
+-	 */
+-	private List<Pair<Set<Literal>, Set<Literal>>> findCauses(CausalModel causalModel, Formula phi,
+-			Set<Literal> context, Set<Literal> evaluation, FormulaFactory f) throws InvalidCausalModelException {
+-		List<Pair<Set<Literal>, Set<Literal>>> result;
+-		Formula phiNegated = f.not(phi);
+-		Formula formula = generateSATQuery(causalModel, phiNegated, context, evaluation, f);
+-//		System.out.println("G:=" + formula.toString());
+-
+-		try {
+-			result = solveILP(causalModel, phi, formula, evaluation, f);
+-		} catch (ParserException | GRBException e) {
+-			result = null;
+-			e.printStackTrace();
+-		}
+-
+-		return result;
+-	}
+-
+-	/**
+-	 * Generates a formula whose satisfiability indicates whether AC2 is fulfilled
+-	 * or not.
+-	 *
+-	 * @param causalModel the causal model
+-	 * @param notPhi      the negated phi
+-	 * @param cause       the cause
+-	 * @param context     the context
+-	 * @param evaluation  the original evaluation under the given context
+-	 * @param ac3         set to true if used within AC3 check
+-	 * @param f           a formula factory
+-	 * @return a formula
+-	 */
+-	private Formula generateSATQuery(CausalModel causalModel, Formula notPhi, Set<Literal> context,
+-			Set<Literal> evaluation, FormulaFactory f) {
+-		Set<Variable> phiVariables = notPhi.variables();
+-		// create map of variables and corresponding evaluation
+-		Map<Variable, Literal> variableEvaluationMap = evaluation.stream()
+-				.collect(Collectors.toMap(Literal::variable, Function.identity()));
+-		// create formula: !phi AND context
+-		Formula formula = f.and(notPhi, f.and(context));
+-
+-		for (Equation equation : causalModel.getVariableEquationMap().values()) {
+-
+-			// get value of variable in original iteration
+-			Literal originalValue = variableEvaluationMap.get(equation.getVariable());
+-			Formula equationFormula;
+-			if (phiVariables.contains(equation.getVariable())) {
+-				equationFormula = f.equivalence(equation.getVariable(), equation.getFormula());
+-			} else {
+-				Variable c1 = f.variable(C1_VAR_PREFIX + equation.getVariable().name());
+-				Variable c2 = f.variable(C2_VAR_PREFIX + equation.getVariable().name());
+-				equationFormula = f.and(
+-						f.or(f.and(f.equivalence(equation.getVariable(), equation.getFormula()), c1),
+-								f.and(f.not(f.equivalence(equation.getVariable(), equation.getFormula())), f.not(c1))),
+-						f.or(f.and(originalValue, c2), f.and(f.not(originalValue), f.not(c2))));
+-			}
+-			// add created formula to global formula by AND
+-			formula = f.and(formula, equationFormula);
+-		}
+-
+-		return formula;
+-	}
+-
+-	/**
+-	 * This function prepares the ILP program based on the cm and the sat formula
+-	 * Then solves the model using Groupi solver. Lastly, interpret the reults to
+-	 * return two sets one for the minimal cause and one for the non minimal w AC2
+-	 * and AC3 results are not directly returned, but they can be infered from
+-	 * minimal cause set (size >1 AC2 is satisfied, == cause.size ac3 is satisfied)
+-	 * 
+-	 * @param cm
+-	 * @param phi
+-	 * @param satFormula
+-	 * @param cause
+-	 * @param evaluation
+-	 * @param f
+-	 * @return: a list of pairs the first element is the minimal cause, the second
+-	 *          is the non minimal w; returns null if the model is infeasible and
+-	 *          there were no causes infered
+-	 * @throws ParserException
+-	 * @throws GRBException
+-	 * @throws InvalidCausalModelException
+-	 */
+-	public List<Pair<Set<Literal>, Set<Literal>>> solveILP(CausalModel cm, Formula phi, Formula satFormula,
+-			Set<Literal> evaluation, FormulaFactory f)
+-			throws ParserException, GRBException, InvalidCausalModelException {
+-		List<Pair<Set<Literal>, Set<Literal>>> causes = new ArrayList<Pair<Set<Literal>, Set<Literal>>>();
+-		// create and configure the ilp vars
+-		// copy the variables of the causal model to ILP model
+-		GRBModel model = createGRBModel(cm, phi.variables());
+-
+-		// add the constraints based on the formula
+-		addLPConstraints(satFormula, model, f);
+-		// write the model to file for debugging (should be stopped in benchmarks)
+-		model.write("./ILP-models/ptest" + cm.getName() + "why.lp");
+-		model.set(GRB.IntParam.OutputFlag, 0);
+-		// solve the model
+-		model.optimize();
+-//		Feasibility of the program means that there is a cause of size at least 1 (exact size is c3sum), that makes phi not hold, 
+-//		the context set. To process the results:
+-//		1- c1sum is the number of normal variables (evaluate according to their equations), for the exact variables check the C1_Vi=1
+-//		2- c3sum is the size of the cause vector, the exact variables can be deducted by collecting C3_Vx=1 variables  
+-//		3- W size can be calculated using the above(complement-c3sum) , for the exact variables check C1_Vi and C2_Vi should be 01
+-		// OPTIMAL 2 Model was solved to optimality INFEASIBLE 3 Model was proven to be
+-		// infeasible.
+-		if (model.get(GRB.IntAttr.Status) == GRB.INFEASIBLE) {
+-			System.out.println("Model is infeasible.");
+-			causes = null;
+-
+-		} else if (model.get(GRB.IntAttr.Status) == GRB.OPTIMAL) {
+-			causes = new ArrayList<Pair<Set<Literal>, Set<Literal>>>();
+-			// Print number of solutions stored
+-			int nSolutions = model.get(GRB.IntAttr.SolCount);
+-			System.out.println("Number of solutions found: " + nSolutions);
+-
+-			// keep more then cause? yes until we have a better way to compare them
+-			for (int e = 0; e < nSolutions; e++) {
+-				Set<Literal> cause = new HashSet<>();
+-				Set<Literal> w = new HashSet<>();
+-
+-				model.set(GRB.IntParam.SolutionNumber, e);
+-				// first objective value: c1_sum
+-				model.set(GRB.IntParam.ObjNumber, 0);
+-				double obj1 = model.get(GRB.DoubleAttr.ObjNVal);
+-				System.out.print("Normal Vars" + obj1);
+-				// scnd objective value: size of W
+-				model.set(GRB.IntParam.ObjNumber, 1);
+-				double obj2 = model.get(GRB.DoubleAttr.ObjNVal);
+-				System.out.print("	Size of W " + obj2 + "\n");
+-
+-				// loop the original variables and fetch their control vars
+-				for (Literal variable : evaluation) {
+-					String name = variable.name();
+-					if (phi.containsVariable(name) || cm.getExogenousVariables().stream()
+-							.filter(l -> l.name().equals(name)).findAny().isPresent()) {// is from the effect variables
+-						continue;
+-					} else {
+-						GRBVar c3 = model.getVarByName(C3_VAR_PREFIX + name);
+-						if (c3.get(GRB.DoubleAttr.Xn) == 1.0)// this is a cause
+-						{
+-							cause.add(variable);
+-							continue;
+-						} else {
+-							GRBVar c1 = model.getVarByName(C1_VAR_PREFIX + name);
+-							GRBVar c2 = model.getVarByName(C2_VAR_PREFIX + name);
+-							if (c1.get(GRB.DoubleAttr.Xn) == 0 && (c2.get(GRB.DoubleAttr.X) == 1.0))// this is a W
+-							{
+-								w.add(variable);
+-							}
+-
+-						}
+-					}
+-
+-					// TODO this loop can be optimized by checking the sizes of current causes and w
+-					// and breaking once done
+-
+-				}
+-
+-				System.out.println("cause " + cause);
+-				System.out.println("W " + w);
+-				causes.add(new Pair(cause, w));
+-			}
+-		} else {
+-			System.out.println("Unhandled ILP status " + model.get(GRB.IntAttr.Status) + " check ILP log");
+-			causes = null;
+-		}
+-		// Dispose of model and environment
+-		model.dispose();
+-		model.getEnv().dispose();
+-
+-		return causes;
+-	}
+-
+-	private void printProblem(Formula satFormula, Set<Literal> cause, Set<Literal> evaluation) {
+-		System.out.println("SATFormula*****" + satFormula);
+-		cause.forEach(c -> System.out.println(c.name() + "" + c.phase()));
+-		System.out.println("evaluation");
+-		evaluation.forEach(c -> System.out.println(c.name() + "" + c.phase()));
+-	}
+-
+-	/**
+-	 * a function that turns a custom causal model to Gurobi causal model the
+-	 * location should be changed to inside the causal model for example
+-	 * 
+-	 * @param cm
+-	 * @param phiVariables
+-	 * @param model
+-	 */
+-	public GRBModel createGRBModel(CausalModel cm, SortedSet<Variable> phiVariables) throws GRBException {
+-		// basic GRB model, parameters of the model should be set here
+-		GRBEnv env = new GRBEnv("./ILP-LOG/" + cm.getName() + "_why.log");
+-		GRBModel model = new GRBModel(env);
+-
+-		GRBLinExpr c1SumExp = new GRBLinExpr();
+-		GRBLinExpr c3SumExp = new GRBLinExpr();
+-		// start with exo vars
+-		cm.getExogenousVariables().forEach(item -> {
+-			try {
+-				model.addVar(0.0, 1.0, 0.0, GRB.BINARY, item.name());
+-			} catch (GRBException e) {
+-				e.printStackTrace();
+-			}
+-		});
+-		// for each endogenous variable not in phi add 3 vars
+-		cm.getEquationsSorted().forEach(e -> {
+-			try {
+-				model.addVar(0.0, 1.0, 0.0, GRB.BINARY, e.getVariable().name());
+-				if (!phiVariables.contains(e.getVariable())) {
+-					GRBVar c1 = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, C1_VAR_PREFIX + e.getVariable().name());
+-					GRBVar c2 = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, C2_VAR_PREFIX + e.getVariable().name());
+-					GRBVar c3 = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, C3_VAR_PREFIX + e.getVariable().name());
+-					// doing an exception of adding the c1,c2,c3 constraints here before the CNF
+-					// constraints
+-					// because i don't want to loop again
+-					// c3 =~c1 /\ ~c2 e.g., - cbt1 - cbt2 - 2 cbt3 <= -1 - cbt1 - cbt2 - 2 cbt3 >=-2
+-					GRBLinExpr expr = new GRBLinExpr();
+-					expr.addTerm(-1.0, c1);
+-					expr.addTerm(-1.0, c2);
+-					expr.addTerm(-2.0, c3);
+-					model.addConstr(expr, GRB.LESS_EQUAL, -1.0, "c3_" + e.getVariable().name() + "_1");
+-					model.addConstr(expr, GRB.GREATER_EQUAL, -2.0, "c3_" + e.getVariable().name() + "_2");
+-
+-					// prepare the c1 and c3 sums
+-					c1SumExp.addTerm(1.0, c1);
+-					c3SumExp.addTerm(1.0, c3);
+-				}
+-			} catch (GRBException e1) {
+-				e1.printStackTrace();
+-			}
+-		});
+-
+-		// add the overall variables c1_sum, c1_complement, c3_ sum
+-		GRBVar c1sum = model.addVar(0.0, cm.getEquationsSorted().size() - phiVariables.size(), 0.0, GRB.INTEGER,
+-				C1_SUM_VAR);
+-		GRBVar c1ComSum = model.addVar(0.0, cm.getEquationsSorted().size() - phiVariables.size(), 0.0, GRB.INTEGER,
+-				C1COM_SUM_VAR);
+-		GRBVar c3sum = model.addVar(1.0, cm.getEquationsSorted().size() - phiVariables.size(), 0.0, GRB.INTEGER,
+-				C3_SUM_VAR);
+-
+-//		// stupid hack should be removed
+-//		for (int i = 0; i < 15000; i++) {
+-//			model.addVar(0.0, 1.0, 0.0, GRB.BINARY, "@RESERVED_CNF_"+i );
+-//
+-//		}
+-//		
+-		// finalize the equations for the sum constraints
+-		c1SumExp.addTerm(-1, c1sum);
+-		model.addConstr(c1SumExp, GRB.EQUAL, 0, "c1Sum");
+-
+-		c3SumExp.addTerm(-1, c3sum);
+-		model.addConstr(c3SumExp, GRB.EQUAL, 0, "c3Sum");
+-
+-		GRBLinExpr expr2 = new GRBLinExpr();
+-		expr2.addTerm(1, c1sum);
+-		expr2.addTerm(1, c1ComSum);
+-		model.addConstr(expr2, GRB.EQUAL, cm.getEquationsSorted().size() - phiVariables.size(), "c1ComSum");
+-
+-		// Apparently should call this method so that the model is in sync
+-		model.update();
+-		return model;
+-
+-	}
+-
+-	/**
+-	 * a function that converts CNF clauses to GRB constraints
+-	 * 
+-	 * @param fm
+-	 * @param model
+-	 * @param f
+-	 * @throws GRBException
+-	 */
+-	public void addLPConstraints(Formula satFormula, GRBModel model, FormulaFactory f) throws GRBException {
+-
+-		GRBLinExpr expr = new GRBLinExpr();
+-		// OBJ0: Priority=2 Weight=1 AbsTol=0 RelTol=0
+-		// c1sum
+-		// OBJ1: Priority=1 Weight=1 AbsTol=0 RelTol=0
+-		// c1sumcomplement - c3sum
+-
+-		// Set global sense for ALL objectives
+-
+-		model.set(GRB.IntAttr.ModelSense, GRB.MAXIMIZE);
+-
+-		GRBLinExpr objn0 = new GRBLinExpr();
+-		String vname = "OBJ0";
+-		objn0.addTerm(1.0, model.getVarByName(C1_SUM_VAR));
+-
+-		model.setObjectiveN(objn0, 0, 2, 1, 0, 0, vname);
+-
+-		GRBLinExpr objn1 = new GRBLinExpr();
+-		String vname2 = "OBJ1";
+-		objn1.addTerm(1.0, model.getVarByName(C1COM_SUM_VAR));
+-		objn1.addTerm(-1.0, model.getVarByName(C3_SUM_VAR));
+-
+-		model.setObjectiveN(objn1, 1, 1, 1, 0, 0, vname2);
+-
+-		// add constraints to the ILP model based on the CNF clauses
+-		// this formula doesn't contain any constraint about the cause
+-//		PropositionalParser p = new PropositionalParser(f);
+-//		Formula cnf = satFormula.transform(new CNFFactorization());
+-		Iterator<Formula> iter = satFormula.cnf().iterator();
+-//TODO check the performance of this against satFormula.cnf();
+-		// https://github.com/logic-ng/LogicNG/issues/15
+-
+-		while (iter.hasNext()) {
+-			// one clause in the cnf
+-			Formula clause = iter.next();
+-			if (clause.isAtomicFormula()) { // Assignment mainly for the effect and the context
+-				// R118: BS = 0
+-				Literal literal = (Literal) clause;
+-				expr = new GRBLinExpr();
+-				expr.addTerm(1.0, model.getVarByName(literal.name()));
+-				model.addConstr(expr, GRB.EQUAL, literal.phase() ? 1.0 : 0.0, "");
+-			} else {
+-				Iterator<Formula> literals = clause.iterator();
+-
+-				expr = new GRBLinExpr();
+-				while (literals.hasNext()) {
+-					Literal literal = (Literal) literals.next();
+-					if (literal.phase()) {
+-						expr.addTerm(1.0, model.getVarByName(literal.name()));
+-					} else {
+-						expr.addTerm(-1.0, model.getVarByName(literal.name()));
+-						expr.addConstant(1.0);
+-					}
+-				}
+-//				try {
+-				model.addConstr(expr, GRB.GREATER_EQUAL, 1.0, "");
+-//				TODO need a way here to catch  "@RESERVED_CNF_0" variable name and adding it as a var then the constraint
+-
+-//			} catch (Exception e) {
+-//				System.out.println("here");
+-//				// so far i know about the exception thrown because of the added vars by logicng
+-//				// TODO hardcoded
+-//				
+-//				model.addConstr(expr, GRB.GREATER_EQUAL, 1.0, "");
+-////				System.out.println(expr);
+-////				e.printStackTrace();
+-//			}
+-			}
+-
+-		}
+-
+-	}
+-
+-
++    @Override
++    CausalitySolverResult solve(CausalModel causalModel, Set<Literal> context, Formula phi,
++                                Set<Literal> cause, SolvingStrategy solvingStrategy)
++            throws InvalidCausalModelException {
++        throw new UnsupportedOperationException("NumericSolver requires Gurobi (unavailable)");
++    }
+ }
+diff --git a/src/main/java/de/tum/in/i4/hp2sat/causality/WhySolver.java b/src/main/java/de/tum/in/i4/hp2sat/causality/WhySolver.java
+index 6ac61f3..e5adc00 100644
+--- a/src/main/java/de/tum/in/i4/hp2sat/causality/WhySolver.java
++++ b/src/main/java/de/tum/in/i4/hp2sat/causality/WhySolver.java
+@@ -1,470 +1,15 @@
+ package de.tum.in.i4.hp2sat.causality;
+ 
+ import de.tum.in.i4.hp2sat.exceptions.InvalidCausalModelException;
+-import gurobi.GRB;
+-import gurobi.GRBEnv;
+-import gurobi.GRBException;
+-import gurobi.GRBLinExpr;
+-import gurobi.GRBModel;
+-import gurobi.GRBVar;
+-
+-import org.logicng.datastructures.Assignment;
+-import org.logicng.datastructures.Tristate;
+ import org.logicng.formulas.Formula;
+-import org.logicng.formulas.FormulaFactory;
+ import org.logicng.formulas.Literal;
+-import org.logicng.formulas.Variable;
+-import org.logicng.io.parsers.ParserException;
+-import org.logicng.io.parsers.PropositionalParser;
+-import org.logicng.solvers.CleaneLing;
+-import org.logicng.solvers.MiniSat;
+-import org.logicng.solvers.SATSolver;
+-import org.logicng.transformations.cnf.CNFFactorization;
+-import org.logicng.util.Pair;
+-
+-import java.util.*;
+-import java.util.function.Function;
+-import java.util.stream.Collectors;
+-
+-import static de.tum.in.i4.hp2sat.causality.ILPSolverType.GUROBI;
+-import static de.tum.in.i4.hp2sat.causality.SATSolverType.GLUCOSE;
+-import static de.tum.in.i4.hp2sat.causality.SATSolverType.MINICARD;
+-import static de.tum.in.i4.hp2sat.causality.SATSolverType.MINISAT;
+-import static de.tum.in.i4.hp2sat.causality.SolvingStrategy.*;
++import java.util.Set;
+ 
+ class WhySolver extends CausalitySolver {
+-	static final String C1_VAR_PREFIX = "C1_";
+-	static final String C2_VAR_PREFIX = "C2_";
+-	static final String C3_VAR_PREFIX = "C3_";
+-	static final String C1_SUM_VAR = C1_VAR_PREFIX + "sum";
+-	static final String C1COM_SUM_VAR = C1_VAR_PREFIX + "com_sum";
+-	static final String C3_SUM_VAR = C3_VAR_PREFIX + "sum";
+-	
+-	
+-	
+-
+-	@Override
+-	CausalitySolverResult solve(CausalModel causalModel, Set<Literal> context, Formula phi, Set<Literal> cause,
+-			SolvingStrategy solvingStrategy) throws InvalidCausalModelException {
+-		// TODO Auto-generated method stub
+-		return null;
+-	}
+-
+-	/**
+-	 * {@link CausalitySolver#solve(CausalModel, Set, Formula, Set, SolvingStrategy)}.
+-	 * Default SATSolver: MINISAT
+-	 *
+-	 * @param causalModel     the underlying causal model
+-	 * @param context         the context
+-	 * @param phi             the phi
+-	 * @param solvingStrategy the applied solving strategy
+-	 * @return for each AC, true if fulfilled, false else
+-	 * @throws InvalidCausalModelException thrown if internally generated causal
+-	 *                                     models are invalid
+-	 */
+-	
+-	List<CausalitySolverResult> solveWhy(CausalModel causalModel, Set<Literal> context, Formula phi, Set<Literal> cause,
+-			SolvingStrategy solvingStrategy) throws InvalidCausalModelException {
+-		return solve(causalModel, context, phi);
+-	}
+-
+-	/**
+-	 * Checks AC1, AC2 and AC3 given a causal model, a cause, a context and phi and
+-	 * a solving strategy.
+-	 *
+-	 * @param causalModel the underlying causal model
+-	 * @param context     the context
+-	 * @param phi         the phi
+-	 * @return for each AC, true if fulfilled, false else
+-	 * @throws InvalidCausalModelException thrown if internally generated causal
+-	 *                                     models are invalid
+-	 */
+-	List<CausalitySolverResult> solve(CausalModel causalModel, Set<Literal> context, Formula phi)
+-			throws InvalidCausalModelException {
+-		FormulaFactory f = new FormulaFactory();
+-		Set<Literal> evaluation = CausalitySolver.evaluateEquations(causalModel, context);
+-
+-		List<Pair<Set<Literal>, Set<Literal>>> result = findCauses(causalModel, phi, context, evaluation, f);
+-		List<CausalitySolverResult> causes = new ArrayList<CausalitySolverResult>();
+-		if (result == null) {
+-			return causes;
+-		}
+-//		convert to results objects
+-		for (Pair<Set<Literal>, Set<Literal>> actualCause : result) {
+-			// TODO should we check ac1 after the results are obtained
+-			boolean ac2 = false, ac3 = false, ac1 = false;
+-			Set<Literal> w;
+-			Set<Literal> cause;
+-			// we want to find a possible cause with some criteria
+-
+-			cause = actualCause.first();
+-			w = actualCause.second();
+-
+-			if (cause != null) {
+-				if (cause.isEmpty()) {// means we did n't have to flip anything, couldn't happen because of minimum
+-										// distance constraint
+-					ac2 = ac3 = false;
+-					System.out.println("The effect is not at all affected by the cause");
+-				} else {
+-					ac1 = true;
+-					ac2 = true; // maybe this is a harsh conclusion
+-					ac3 = true;
+-				}
+-
+-			}
+-			CausalitySolverResult causalitySolverResult = new CausalitySolverResult(ac1, ac2, ac3, cause, w);
+-			causes.add(causalitySolverResult);
+-		}
+-		return causes;
+-	}
+-
+-	/**
+-	 * Checks if AC2 and AC3 are fulfilled. Combined approach that takes advantage
+-	 * of synergies between the separate approaches.
+-	 *
+-	 * @param causalModel     the underlying causal model
+-	 * @param phi             the phi
+-	 * @param cause           the cause for which we check AC2
+-	 * @param context         the context
+-	 * @param evaluation      the original evaluation of variables
+-	 * @param solvingStrategy the solving strategy
+-	 * @param satSolverType   the to be used SAT solver
+-	 * @param f               a formula factory
+-	 * @return a tuple of set W and a boolean value indicating whether AC3 is
+-	 *         fulfilled or not
+-	 * @throws InvalidCausalModelException thrown if internally generated causal
+-	 *                                     models are invalid
+-	 */
+-	private List<Pair<Set<Literal>, Set<Literal>>> findCauses(CausalModel causalModel, Formula phi,
+-			Set<Literal> context, Set<Literal> evaluation, FormulaFactory f) throws InvalidCausalModelException {
+-		List<Pair<Set<Literal>, Set<Literal>>> result;
+-		Formula phiNegated = f.not(phi);
+-		Formula formula = generateSATQuery(causalModel, phiNegated, context, evaluation, f);
+-//		System.out.println("G:=" + formula.toString());
+-
+-		try {
+-			result = solveILP(causalModel, phi, formula, evaluation, f);
+-		} catch (ParserException | GRBException e) {
+-			result = null;
+-			e.printStackTrace();
+-		}
+-
+-		return result;
+-	}
+-
+-	/**
+-	 * Generates a formula whose satisfiability indicates whether AC2 is fulfilled
+-	 * or not.
+-	 *
+-	 * @param causalModel the causal model
+-	 * @param notPhi      the negated phi
+-	 * @param cause       the cause
+-	 * @param context     the context
+-	 * @param evaluation  the original evaluation under the given context
+-	 * @param ac3         set to true if used within AC3 check
+-	 * @param f           a formula factory
+-	 * @return a formula
+-	 */
+-	private Formula generateSATQuery(CausalModel causalModel, Formula notPhi, Set<Literal> context,
+-			Set<Literal> evaluation, FormulaFactory f) {
+-		Set<Variable> phiVariables = notPhi.variables();
+-		// create map of variables and corresponding evaluation
+-		Map<Variable, Literal> variableEvaluationMap = evaluation.stream()
+-				.collect(Collectors.toMap(Literal::variable, Function.identity()));
+-		// create formula: !phi AND context
+-		Formula formula = f.and(notPhi, f.and(context));
+-
+-		for (Equation equation : causalModel.getVariableEquationMap().values()) {
+-
+-			// get value of variable in original iteration
+-			Literal originalValue = variableEvaluationMap.get(equation.getVariable());
+-			Formula equationFormula;
+-			if (phiVariables.contains(equation.getVariable())) {
+-				equationFormula = f.equivalence(equation.getVariable(), equation.getFormula());
+-			} else {
+-				Variable c1 = f.variable(C1_VAR_PREFIX + equation.getVariable().name());
+-				Variable c2 = f.variable(C2_VAR_PREFIX + equation.getVariable().name());
+-				equationFormula = f.and(
+-						f.or(f.and(f.equivalence(equation.getVariable(), equation.getFormula()), c1),
+-								f.and(f.not(f.equivalence(equation.getVariable(), equation.getFormula())), f.not(c1))),
+-						f.or(f.and(originalValue, c2), f.and(f.not(originalValue), f.not(c2))));
+-			}
+-			// add created formula to global formula by AND
+-			formula = f.and(formula, equationFormula);
+-		}
+-
+-		return formula;
+-	}
+-
+-	/**
+-	 * This function prepares the ILP program based on the cm and the sat formula
+-	 * Then solves the model using Groupi solver. Lastly, interpret the reults to
+-	 * return two sets one for the minimal cause and one for the non minimal w AC2
+-	 * and AC3 results are not directly returned, but they can be infered from
+-	 * minimal cause set (size >1 AC2 is satisfied, == cause.size ac3 is satisfied)
+-	 * 
+-	 * @param cm
+-	 * @param phi
+-	 * @param satFormula
+-	 * @param cause
+-	 * @param evaluation
+-	 * @param f
+-	 * @return: a list of pairs the first element is the minimal cause, the second
+-	 *          is the non minimal w; returns null if the model is infeasible and
+-	 *          there were no causes infered
+-	 * @throws ParserException
+-	 * @throws GRBException
+-	 * @throws InvalidCausalModelException
+-	 */
+-	public List<Pair<Set<Literal>, Set<Literal>>> solveILP(CausalModel cm, Formula phi, Formula satFormula,
+-			Set<Literal> evaluation, FormulaFactory f)
+-			throws ParserException, GRBException, InvalidCausalModelException {
+-		List<Pair<Set<Literal>, Set<Literal>>> causes = new ArrayList<Pair<Set<Literal>, Set<Literal>>>();
+-		// create and configure the ilp vars
+-		// copy the variables of the causal model to ILP model
+-		GRBModel model = createGRBModel(cm, phi.variables());
+-
+-		// add the constraints based on the formula
+-		addLPConstraints(satFormula, model, f);
+-		// write the model to file for debugging (should be stopped in benchmarks)
+-		model.write("./ILP-models/ptest" + cm.getName() + "why.lp");
+-		model.set(GRB.IntParam.OutputFlag, 0);
+-		// solve the model
+-		model.optimize();
+-//		Feasibility of the program means that there is a cause of size at least 1 (exact size is c3sum), that makes phi not hold, 
+-//		the context set. To process the results:
+-//		1- c1sum is the number of normal variables (evaluate according to their equations), for the exact variables check the C1_Vi=1
+-//		2- c3sum is the size of the cause vector, the exact variables can be deducted by collecting C3_Vx=1 variables  
+-//		3- W size can be calculated using the above(complement-c3sum) , for the exact variables check C1_Vi and C2_Vi should be 01
+-		// OPTIMAL 2 Model was solved to optimality INFEASIBLE 3 Model was proven to be
+-		// infeasible.
+-		if (model.get(GRB.IntAttr.Status) == GRB.INFEASIBLE) {
+-			System.out.println("Model is infeasible.");
+-			causes = null;
+-
+-		} else if (model.get(GRB.IntAttr.Status) == GRB.OPTIMAL) {
+-			causes = new ArrayList<Pair<Set<Literal>, Set<Literal>>>();
+-			// Print number of solutions stored
+-			int nSolutions = model.get(GRB.IntAttr.SolCount);
+-			System.out.println("Number of solutions found: " + nSolutions);
+-
+-			// keep more then cause? yes until we have a better way to compare them
+-			for (int e = 0; e < nSolutions; e++) {
+-				Set<Literal> cause = new HashSet<>();
+-				Set<Literal> w = new HashSet<>();
+-
+-				model.set(GRB.IntParam.SolutionNumber, e);
+-				// first objective value: c1_sum
+-				model.set(GRB.IntParam.ObjNumber, 0);
+-				double obj1 = model.get(GRB.DoubleAttr.ObjNVal);
+-				System.out.print("Normal Vars" + obj1);
+-				// scnd objective value: size of W
+-				model.set(GRB.IntParam.ObjNumber, 1);
+-				double obj2 = model.get(GRB.DoubleAttr.ObjNVal);
+-				System.out.print("	Size of W " + obj2 + "\n");
+-
+-				// loop the original variables and fetch their control vars
+-				for (Literal variable : evaluation) {
+-					String name = variable.name();
+-					if (phi.containsVariable(name) || cm.getExogenousVariables().stream()
+-							.filter(l -> l.name().equals(name)).findAny().isPresent()) {// is from the effect variables
+-						continue;
+-					} else {
+-						GRBVar c3 = model.getVarByName(C3_VAR_PREFIX + name);
+-						if (c3.get(GRB.DoubleAttr.Xn) == 1.0)// this is a cause
+-						{
+-							cause.add(variable);
+-							continue;
+-						} else {
+-							GRBVar c1 = model.getVarByName(C1_VAR_PREFIX + name);
+-							GRBVar c2 = model.getVarByName(C2_VAR_PREFIX + name);
+-							if (c1.get(GRB.DoubleAttr.Xn) == 0 && (c2.get(GRB.DoubleAttr.X) == 1.0))// this is a W
+-							{
+-								w.add(variable);
+-							}
+-
+-						}
+-					}
+-
+-					// TODO this loop can be optimized by checking the sizes of current causes and w
+-					// and breaking once done
+-
+-				}
+-
+-				System.out.println("cause " + cause);
+-				System.out.println("W " + w);
+-				causes.add(new Pair(cause, w));
+-			}
+-		} else {
+-			System.out.println("Unhandled ILP status " + model.get(GRB.IntAttr.Status) + " check ILP log");
+-			causes = null;
+-		}
+-		// Dispose of model and environment
+-		model.dispose();
+-		model.getEnv().dispose();
+-
+-		return causes;
+-	}
+-
+-	private void printProblem(Formula satFormula, Set<Literal> cause, Set<Literal> evaluation) {
+-		System.out.println("SATFormula*****" + satFormula);
+-		cause.forEach(c -> System.out.println(c.name() + "" + c.phase()));
+-		System.out.println("evaluation");
+-		evaluation.forEach(c -> System.out.println(c.name() + "" + c.phase()));
+-	}
+-
+-	/**
+-	 * a function that turns a custom causal model to Gurobi causal model the
+-	 * location should be changed to inside the causal model for example
+-	 * 
+-	 * @param cm
+-	 * @param phiVariables
+-	 * @param model
+-	 */
+-	public GRBModel createGRBModel(CausalModel cm, SortedSet<Variable> phiVariables) throws GRBException {
+-		// basic GRB model, parameters of the model should be set here
+-		GRBEnv env = new GRBEnv("./ILP-LOG/" + cm.getName() + "_why.log");
+-		GRBModel model = new GRBModel(env);
+-
+-		GRBLinExpr c1SumExp = new GRBLinExpr();
+-		GRBLinExpr c3SumExp = new GRBLinExpr();
+-		// start with exo vars
+-		cm.getExogenousVariables().forEach(item -> {
+-			try {
+-				model.addVar(0.0, 1.0, 0.0, GRB.BINARY, item.name());
+-			} catch (GRBException e) {
+-				e.printStackTrace();
+-			}
+-		});
+-		// for each endogenous variable not in phi add 3 vars
+-		cm.getEquationsSorted().forEach(e -> {
+-			try {
+-				model.addVar(0.0, 1.0, 0.0, GRB.BINARY, e.getVariable().name());
+-				if (!phiVariables.contains(e.getVariable())) {
+-					GRBVar c1 = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, C1_VAR_PREFIX + e.getVariable().name());
+-					GRBVar c2 = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, C2_VAR_PREFIX + e.getVariable().name());
+-					GRBVar c3 = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, C3_VAR_PREFIX + e.getVariable().name());
+-					// doing an exception of adding the c1,c2,c3 constraints here before the CNF
+-					// constraints
+-					// because i don't want to loop again
+-					// c3 =~c1 /\ ~c2 e.g., - cbt1 - cbt2 - 2 cbt3 <= -1 - cbt1 - cbt2 - 2 cbt3 >=-2
+-					GRBLinExpr expr = new GRBLinExpr();
+-					expr.addTerm(-1.0, c1);
+-					expr.addTerm(-1.0, c2);
+-					expr.addTerm(-2.0, c3);
+-					model.addConstr(expr, GRB.LESS_EQUAL, -1.0, "c3_" + e.getVariable().name() + "_1");
+-					model.addConstr(expr, GRB.GREATER_EQUAL, -2.0, "c3_" + e.getVariable().name() + "_2");
+-
+-					// prepare the c1 and c3 sums
+-					c1SumExp.addTerm(1.0, c1);
+-					c3SumExp.addTerm(1.0, c3);
+-				}
+-			} catch (GRBException e1) {
+-				e1.printStackTrace();
+-			}
+-		});
+-
+-		// add the overall variables c1_sum, c1_complement, c3_ sum
+-		GRBVar c1sum = model.addVar(0.0, cm.getEquationsSorted().size() - phiVariables.size(), 0.0, GRB.INTEGER,
+-				C1_SUM_VAR);
+-		GRBVar c1ComSum = model.addVar(0.0, cm.getEquationsSorted().size() - phiVariables.size(), 0.0, GRB.INTEGER,
+-				C1COM_SUM_VAR);
+-		GRBVar c3sum = model.addVar(1.0, cm.getEquationsSorted().size() - phiVariables.size(), 0.0, GRB.INTEGER,
+-				C3_SUM_VAR);
+-
+-
+-		// finalize the equations for the sum constraints
+-		c1SumExp.addTerm(-1, c1sum);
+-		model.addConstr(c1SumExp, GRB.EQUAL, 0, "c1Sum");
+-
+-		c3SumExp.addTerm(-1, c3sum);
+-		model.addConstr(c3SumExp, GRB.EQUAL, 0, "c3Sum");
+-
+-		GRBLinExpr expr2 = new GRBLinExpr();
+-		expr2.addTerm(1, c1sum);
+-		expr2.addTerm(1, c1ComSum);
+-		model.addConstr(expr2, GRB.EQUAL, cm.getEquationsSorted().size() - phiVariables.size(), "c1ComSum");
+-
+-		// Apparently should call this method so that the model is in sync
+-		model.update();
+-		return model;
+-
+-	}
+-
+-	/**
+-	 * a function that converts CNF clauses to GRB constraints
+-	 * 
+-	 * @param fm
+-	 * @param model
+-	 * @param f
+-	 * @throws GRBException
+-	 */
+-	public void addLPConstraints(Formula satFormula, GRBModel model, FormulaFactory f) throws GRBException {
+-
+-		GRBLinExpr expr = new GRBLinExpr();
+-		// OBJ0: Priority=2 Weight=1 AbsTol=0 RelTol=0
+-		// c1sum
+-		// OBJ1: Priority=1 Weight=1 AbsTol=0 RelTol=0
+-		// c1sumcomplement - c3sum
+-
+-		// Set global sense for ALL objectives
+-
+-		model.set(GRB.IntAttr.ModelSense, GRB.MAXIMIZE);
+-
+-		GRBLinExpr objn0 = new GRBLinExpr();
+-		String vname = "OBJ0";
+-		objn0.addTerm(1.0, model.getVarByName(C1_SUM_VAR));
+-
+-		model.setObjectiveN(objn0, 0, 2, 1, 0, 0, vname);
+-
+-		GRBLinExpr objn1 = new GRBLinExpr();
+-		String vname2 = "OBJ1";
+-		objn1.addTerm(1.0, model.getVarByName(C1COM_SUM_VAR));
+-		objn1.addTerm(-1.0, model.getVarByName(C3_SUM_VAR));
+-
+-		model.setObjectiveN(objn1, 1, 1, 1, 0, 0, vname2);
+-
+-		// add constraints to the ILP model based on the CNF clauses
+-		// this formula doesn't contain any constraint about the cause
+-//		PropositionalParser p = new PropositionalParser(f);
+-//		Formula cnf = satFormula.transform(new CNFFactorization());
+-		Iterator<Formula> iter = satFormula.cnf().iterator();
+-//TODO check the performance of this against satFormula.cnf();
+-		// https://github.com/logic-ng/LogicNG/issues/15
+-
+-		while (iter.hasNext()) {
+-			// one clause in the cnf
+-			Formula clause = iter.next();
+-			if (clause.isAtomicFormula()) { // Assignment mainly for the effect and the context
+-				// R118: BS = 0
+-				Literal literal = (Literal) clause;
+-				expr = new GRBLinExpr();
+-				expr.addTerm(1.0, model.getVarByName(literal.name()));
+-				model.addConstr(expr, GRB.EQUAL, literal.phase() ? 1.0 : 0.0, "");
+-			} else {
+-				Iterator<Formula> literals = clause.iterator();
+-
+-				expr = new GRBLinExpr();
+-				while (literals.hasNext()) {
+-					Literal literal = (Literal) literals.next();
+-					if (literal.phase()) {
+-						expr.addTerm(1.0, model.getVarByName(literal.name()));
+-					} else {
+-						expr.addTerm(-1.0, model.getVarByName(literal.name()));
+-						expr.addConstant(1.0);
+-					}
+-				}
+-				try {
+-				model.addConstr(expr, GRB.GREATER_EQUAL, 1.0, "");
+-
+-			} catch (Exception e) {
+-				e.printStackTrace();
+-			}
+-			}
+-
+-		}
+-
+-	}
+-
+-
++    @Override
++    CausalitySolverResult solve(CausalModel causalModel, Set<Literal> context, Formula phi,
++                                Set<Literal> cause, SolvingStrategy solvingStrategy)
++            throws InvalidCausalModelException {
++        throw new UnsupportedOperationException("WhySolver requires Gurobi (unavailable)");
++    }
+ }
+diff --git a/src/main/java/de/tum/in/i4/hp2sat/causality/WhySolverCNF.java b/src/main/java/de/tum/in/i4/hp2sat/causality/WhySolverCNF.java
+index 90060c4..58e79f2 100644
+--- a/src/main/java/de/tum/in/i4/hp2sat/causality/WhySolverCNF.java
++++ b/src/main/java/de/tum/in/i4/hp2sat/causality/WhySolverCNF.java
+@@ -1,474 +1,15 @@
+ package de.tum.in.i4.hp2sat.causality;
+ 
+ import de.tum.in.i4.hp2sat.exceptions.InvalidCausalModelException;
+-import gurobi.GRB;
+-import gurobi.GRBEnv;
+-import gurobi.GRBException;
+-import gurobi.GRBLinExpr;
+-import gurobi.GRBModel;
+-import gurobi.GRBVar;
+-
+ import org.logicng.formulas.Formula;
+-import org.logicng.formulas.FormulaFactory;
+ import org.logicng.formulas.Literal;
+-import org.logicng.formulas.Variable;
+-import org.logicng.io.parsers.ParserException;
+-import org.logicng.transformations.cnf.CNFConfig;
+-import org.logicng.transformations.cnf.CNFEncoder;
+-import org.logicng.util.Pair;
+-
+-import java.util.*;
+-import java.util.function.Function;
+-import java.util.stream.Collectors;
+-
++import java.util.Set;
+ 
+ class WhySolverCNF extends CausalitySolver {
+-	static final String C1_VAR_PREFIX = "C1_"; 
+-	static final String C2_VAR_PREFIX = "C2_";
+-	static final String C3_VAR_PREFIX = "C3_";
+-	static final String C1_SUM_VAR = C1_VAR_PREFIX + "sum";
+-	static final String C1COM_SUM_VAR = C1_VAR_PREFIX + "com_sum";
+-	static final String C3_SUM_VAR = C3_VAR_PREFIX + "sum";
+-	
+-
+-	@Override
+-	CausalitySolverResult solve(CausalModel causalModel, Set<Literal> context, Formula phi, Set<Literal> cause,
+-			SolvingStrategy solvingStrategy) throws InvalidCausalModelException {
+-		List<CausalitySolverResult> causes = solve(causalModel, context, phi);
+-//		mainly for benchmarking
+-		if (causes.isEmpty()) {
+-			return new CausalitySolverResult<>();
+-		}
+-		return causes.get(0);
+-	}
+-
+-	/**
+-	 * {@link CausalitySolver#solve(CausalModel, Set, Formula, Set, SolvingStrategy)}.
+-	 * Default SATSolver: MINISAT
+-	 *
+-	 * @param causalModel     the underlying causal model
+-	 * @param context         the context
+-	 * @param phi             the phi
+-	 * @param solvingStrategy the applied solving strategy
+-	 * @return for each AC, true if fulfilled, false else
+-	 * @throws InvalidCausalModelException thrown if internally generated causal
+-	 *                                     models are invalid
+-	 */
+-	
+-	List<CausalitySolverResult> solveWhy(CausalModel causalModel, Set<Literal> context, Formula phi, Set<Literal> cause,
+-			SolvingStrategy solvingStrategy) throws InvalidCausalModelException {
+-		return solve(causalModel, context, phi);
+-	}
+-
+-	/**
+-	 * Checks AC1, AC2 and AC3 given a causal model, a cause, a context and phi and
+-	 * a solving strategy.
+-	 *
+-	 * @param causalModel the underlying causal model
+-	 * @param context     the context
+-	 * @param phi         the phi
+-	 * @return for each AC, true if fulfilled, false else
+-	 * @throws InvalidCausalModelException thrown if internally generated causal
+-	 *                                     models are invalid
+-	 */
+-	List<CausalitySolverResult> solve(CausalModel causalModel, Set<Literal> context, Formula phi)
+-			throws InvalidCausalModelException {
+-		FormulaFactory f = new FormulaFactory();
+-		Set<Literal> evaluation = CausalitySolver.evaluateEquations(causalModel, context);
+-
+-		List<Pair<Set<Literal>, Set<Literal>>> result = findCauses(causalModel, phi, context, evaluation, f);
+-		List<CausalitySolverResult> causes = new ArrayList<CausalitySolverResult>();
+-		if (result == null) {
+-			return causes;
+-		}
+-//		convert to results objects
+-		for (Pair<Set<Literal>, Set<Literal>> actualCause : result) {
+-			// TODO should we check ac1 after the results are obtained
+-			boolean ac2 = false, ac3 = false, ac1 = false;
+-			Set<Literal> w;
+-			Set<Literal> cause;
+-			// we want to find a possible cause with some criteria
+-
+-			cause = actualCause.first();
+-			w = actualCause.second();
+-
+-			if (cause != null) {
+-				if (cause.isEmpty()) {// means we did n't have to flip anything, couldn't happen because of minimum
+-										// distance constraint
+-					ac2 = ac3 = false;
+-					System.out.println("The effect is not at all affected by the cause");
+-				} else {
+-					ac1 = true;
+-					ac2 = true; // maybe this is a harsh conclusion
+-					ac3 = true;
+-				}
+-
+-			}
+-			CausalitySolverResult causalitySolverResult = new CausalitySolverResult(ac1, ac2, ac3, cause, w);
+-			causes.add(causalitySolverResult);
+-		}
+-		return causes;
+-	}
+-
+-	/**
+-	 * Checks if AC2 and AC3 are fulfilled. Combined approach that takes advantage
+-	 * of synergies between the separate approaches.
+-	 *
+-	 * @param causalModel     the underlying causal model
+-	 * @param phi             the phi
+-	 * @param cause           the cause for which we check AC2
+-	 * @param context         the context
+-	 * @param evaluation      the original evaluation of variables
+-	 * @param solvingStrategy the solving strategy
+-	 * @param satSolverType   the to be used SAT solver
+-	 * @param f               a formula factory
+-	 * @return a tuple of set W and a boolean value indicating whether AC3 is
+-	 *         fulfilled or not
+-	 * @throws InvalidCausalModelException thrown if internally generated causal
+-	 *                                     models are invalid
+-	 */
+-	private List<Pair<Set<Literal>, Set<Literal>>> findCauses(CausalModel causalModel, Formula phi,
+-			Set<Literal> context, Set<Literal> evaluation, FormulaFactory f) throws InvalidCausalModelException {
+-		List<Pair<Set<Literal>, Set<Literal>>> result;
+-		Formula phiNegated = f.not(phi);
+-		Formula formula = generateSATQuery(causalModel, phiNegated, context, evaluation, f);
+-
+-		try {
+-			result = solveILP(causalModel, phi, formula, evaluation, f);
+-		} catch (ParserException | GRBException e) {
+-			result = null;
+-			e.printStackTrace();
+-		}
+-
+-		return result;
+-	}
+-
+-	/**
+-	 * Generates a formula whose satisfiability indicates whether AC2 is fulfilled
+-	 * or not.
+-	 *
+-	 * @param causalModel the causal model
+-	 * @param notPhi      the negated phi
+-	 * @param cause       the cause
+-	 * @param context     the context
+-	 * @param evaluation  the original evaluation under the given context
+-	 * @param ac3         set to true if used within AC3 check
+-	 * @param f           a formula factory
+-	 * @return a formula
+-	 */
+-	private Formula  generateSATQuery(CausalModel causalModel, Formula notPhi, Set<Literal> context,
+-			Set<Literal> evaluation, FormulaFactory f) {
+-		Set<Variable> phiVariables = notPhi.variables();
+-		// create map of variables and corresponding evaluation
+-		Map<Variable, Literal> variableEvaluationMap = evaluation.stream()
+-				.collect(Collectors.toMap(Literal::variable, Function.identity()));
+-		// create formula: !phi AND context
+-		Formula formula = f.and(notPhi.cnf(), f.and(context));
+-
+-		for (Equation equation : causalModel.getVariableEquationMap().values()) {
+-
+-			// get value of variable in original iteration
+-			Literal originalValue = variableEvaluationMap.get(equation.getVariable());
+-			Formula equationFormula;
+-			if (phiVariables.contains(equation.getVariable())) {
+-				equationFormula = f.equivalence(equation.getVariable(), equation.getFormula());
+-			} else {
+-				Variable c1 = f.variable(C1_VAR_PREFIX + equation.getVariable().name());
+-				Variable c2 = f.variable(C2_VAR_PREFIX + equation.getVariable().name());
+-				equationFormula = f.and(
+-						f.or(f.and(f.equivalence(equation.getVariable(), equation.getFormula()), c1),
+-								f.and(f.not(f.equivalence(equation.getVariable(), equation.getFormula())), f.not(c1))),
+-						f.or(f.and(originalValue, c2), f.and(f.not(originalValue), f.not(c2))));
+-			}
+-			// add created formula to global formula by AND
+-			formula = f.and(formula, equationFormula);
+-		}
+-
+-		return formula;
+-	}
+-
+-	/**
+-	 * This function prepares the ILP program based on the cm and the sat formula
+-	 * Then solves the model using Groupi solver. Lastly, interpret the reults to
+-	 * return two sets one for the minimal cause and one for the non minimal w AC2
+-	 * and AC3 results are not directly returned, but they can be infered from
+-	 * minimal cause set (size >1 AC2 is satisfied, == cause.size ac3 is satisfied)
+-	 * 
+-	 * @param cm
+-	 * @param phi
+-	 * @param satFormula
+-	 * @param cause
+-	 * @param evaluation
+-	 * @param f
+-	 * @return: a list of pairs the first element is the minimal cause, the second
+-	 *          is the non minimal w; returns null if the model is infeasible and
+-	 *          there were no causes infered
+-	 * @throws ParserException
+-	 * @throws GRBException
+-	 * @throws InvalidCausalModelException
+-	 */
+-	public List<Pair<Set<Literal>, Set<Literal>>> solveILP(CausalModel cm, Formula phi, Formula satFormula,
+-			Set<Literal> evaluation, FormulaFactory f)
+-			throws ParserException, GRBException, InvalidCausalModelException {
+-		List<Pair<Set<Literal>, Set<Literal>>> causes = new ArrayList<Pair<Set<Literal>, Set<Literal>>>();
+-		// create and configure the ilp vars
+-		// copy the variables of the causal model to ILP model
+-		GRBModel model = createGRBModel(cm, phi.variables());
+-
+-		// add the constraints based on the formula
+-		addLPConstraints(satFormula, model, f);
+-		// write the model to file for debugging (should be stopped in benchmarks)
+-		model.write("./ILP-models/ptest" + cm.getName() + "why.lp");
+-
+-		
+-		
+-		// solve the model
+-		model.optimize();
+-//		Feasibility of the program means that there is a cause of size at least 1 (exact size is c3sum), that makes phi not hold, 
+-//		the context set. To process the results:
+-//		1- c1sum is the number of normal variables (evaluate according to their equations), for the exact variables check the C1_Vi=1
+-//		2- c3sum is the size of the cause vector, the exact variables can be deducted by collecting C3_Vx=1 variables  
+-//		3- W size can be calculated using the above(complement-c3sum) , for the exact variables check C1_Vi and C2_Vi should be 01
+-		// OPTIMAL 2 Model was solved to optimality INFEASIBLE 3 Model was proven to be
+-		// infeasible.
+-		if (model.get(GRB.IntAttr.Status) == GRB.INFEASIBLE) {
+-			System.out.println("Model is infeasible.");
+-			causes = null;
+-
+-		} else if (model.get(GRB.IntAttr.Status) == GRB.OPTIMAL) {
+-			causes = new ArrayList<Pair<Set<Literal>, Set<Literal>>>();
+-			// Print number of solutions stored
+-			int nSolutions = model.get(GRB.IntAttr.SolCount);
+-			System.out.println("Number of solutions found: " + nSolutions);
+-
+-			// keep more then cause? yes until we have a better way to compare them
+-			for (int e = 0; e < nSolutions; e++) {
+-				Set<Literal> cause = new HashSet<>();
+-				Set<Literal> w = new HashSet<>();
+-
+-				model.set(GRB.IntParam.SolutionNumber, e);
+-				// first objective value: c1_sum
+-				model.set(GRB.IntParam.ObjNumber, 0);
+-				double obj1 = model.get(GRB.DoubleAttr.ObjNVal);
+-				System.out.print("Normal Vars" + obj1);
+-				// scnd objective value: size of W
+-				model.set(GRB.IntParam.ObjNumber, 1);
+-				double obj2 = model.get(GRB.DoubleAttr.ObjNVal);
+-				System.out.print("	Size of W " + obj2 + "\n");
+-
+-				// loop the original variables and fetch their control vars
+-				for (Literal variable : evaluation) {
+-					String name = variable.name();
+-					if (phi.containsVariable(name) || cm.getExogenousVariables().stream()
+-							.filter(l -> l.name().equals(name)).findAny().isPresent()) {// is from the effect variables
+-						continue;
+-					} else {
+-						GRBVar c3 = model.getVarByName(C3_VAR_PREFIX + name);
+-						if (c3.get(GRB.DoubleAttr.Xn) == 1.0)// this is a cause
+-						{
+-							cause.add(variable);
+-							continue;
+-						} else {
+-							GRBVar c1 = model.getVarByName(C1_VAR_PREFIX + name);
+-							GRBVar c2 = model.getVarByName(C2_VAR_PREFIX + name);
+-							if (c1.get(GRB.DoubleAttr.Xn) == 0 && (c2.get(GRB.DoubleAttr.Xn) == 1.0))// this is a W
+-							{
+-								w.add(variable);
+-							}
+-
+-						}
+-					}
+-
+-					// TODO this loop can be optimized by checking the sizes of current causes and w
+-					// and breaking once done
+-
+-				}
+-
+-				System.out.println("cause " + cause);
+-				System.out.println("W " + w);
+-				causes.add(new Pair(cause, w));
+-			}
+-		} else {
+-			System.out.println("Unhandled ILP status " + model.get(GRB.IntAttr.Status) + " check ILP log");
+-			causes = null;
+-		}
+-		// Dispose of model and environment
+-		model.dispose();
+-		model.getEnv().dispose();
+-
+-		return causes;
+-	}
+-
+-	private void printProblem(Formula satFormula, Set<Literal> cause, Set<Literal> evaluation) {
+-		System.out.println("SATFormula*****" + satFormula);
+-		cause.forEach(c -> System.out.println(c.name() + "" + c.phase()));
+-		System.out.println("evaluation");
+-		evaluation.forEach(c -> System.out.println(c.name() + "" + c.phase()));
+-	}
+-
+-	/**
+-	 * a function that turns a custom causal model to Gurobi causal model the
+-	 * location should be changed to inside the causal model for example
+-	 * 
+-	 * @param cm
+-	 * @param phiVariables
+-	 * @param model
+-	 */
+-	public GRBModel createGRBModel(CausalModel cm, SortedSet<Variable> phiVariables) throws GRBException {
+-		// basic GRB model, parameters of the model should be set here
+-		GRBEnv env = new GRBEnv("./ILP-LOG/" + cm.getName() + "_why.log");
+-		GRBModel model = new GRBModel(env);
+-		
+-		model.set(GRB.IntParam.OutputFlag, 0);
+-		// options for the solving
+-		// use systematic search to find kth best solutions
+-		model.set(GRB.IntParam.PoolSearchMode, 2);
+-		// k is defined here:
+-		model.set(GRB.IntParam.PoolSolutions, 5);
+-		// don't look for any solution with objective value other than the optimal (Gap =0)
+-		model.set(GRB.DoubleParam.PoolGap,0);
+-		
+-		GRBLinExpr c1SumExp = new GRBLinExpr();
+-		GRBLinExpr c3SumExp = new GRBLinExpr();
+-		// start with exo vars
+-		cm.getExogenousVariables().forEach(item -> {
+-			try {
+-				model.addVar(0.0, 1.0, 0.0, GRB.BINARY, item.name());
+-			} catch (GRBException e) {
+-				e.printStackTrace();
+-			}
+-		});
+-		// for each endogenous variable not in phi add 3 vars
+-		cm.getEquationsSorted().forEach(e -> {
+-			try {
+-				model.addVar(0.0, 1.0, 0.0, GRB.BINARY, e.getVariable().name());
+-				if (!phiVariables.contains(e.getVariable())) {
+-					GRBVar c1 = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, C1_VAR_PREFIX + e.getVariable().name());
+-					GRBVar c2 = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, C2_VAR_PREFIX + e.getVariable().name());
+-					GRBVar c3 = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, C3_VAR_PREFIX + e.getVariable().name());
+-					// doing an exception of adding the c1,c2,c3 constraints here before the CNF
+-					// constraints
+-					// because i don't want to loop again
+-					// c3 =~c1 /\ ~c2 e.g., - cbt1 - cbt2 - 2 cbt3 <= -1 - cbt1 - cbt2 - 2 cbt3 >=-2
+-					GRBLinExpr expr = new GRBLinExpr();
+-					expr.addTerm(-1.0, c1);
+-					expr.addTerm(-1.0, c2);
+-					expr.addTerm(-2.0, c3);
+-					model.addConstr(expr, GRB.LESS_EQUAL, -1.0, "c3_" + e.getVariable().name() + "_1");
+-					model.addConstr(expr, GRB.GREATER_EQUAL, -2.0, "c3_" + e.getVariable().name() + "_2");
+-
+-					// prepare the c1 and c3 sums
+-					c1SumExp.addTerm(1.0, c1);
+-					c3SumExp.addTerm(1.0, c3);
+-				}
+-			} catch (GRBException e1) {
+-				e1.printStackTrace();
+-			}
+-		});
+-
+-		// add the overall variables c1_sum, c1_complement, c3_ sum
+-		GRBVar c1sum = model.addVar(0.0, cm.getEquationsSorted().size() - phiVariables.size(), 0.0, GRB.INTEGER,
+-				C1_SUM_VAR);
+-		GRBVar c1ComSum = model.addVar(0.0, cm.getEquationsSorted().size() - phiVariables.size(), 0.0, GRB.INTEGER,
+-				C1COM_SUM_VAR);
+-		GRBVar c3sum = model.addVar(1.0, cm.getEquationsSorted().size() - phiVariables.size(), 0.0, GRB.INTEGER,
+-				C3_SUM_VAR);
+-
+-
+-		// finalize the equations for the sum constraints
+-		c1SumExp.addTerm(-1, c1sum);
+-		model.addConstr(c1SumExp, GRB.EQUAL, 0, "c1Sum");
+-
+-		c3SumExp.addTerm(-1, c3sum);
+-		model.addConstr(c3SumExp, GRB.EQUAL, 0, "c3Sum");
+-
+-		GRBLinExpr expr2 = new GRBLinExpr();
+-		expr2.addTerm(1, c1sum);
+-		expr2.addTerm(1, c1ComSum);
+-		model.addConstr(expr2, GRB.EQUAL, cm.getEquationsSorted().size() - phiVariables.size(), "c1ComSum");
+-
+-		// Apparently should call this method so that the model is in sync
+-		model.update();
+-		return model;
+-
+-	}
+-
+-	/**
+-	 * a function that converts CNF clauses to GRB constraints
+-	 * 
+-	 * @param fm
+-	 * @param model
+-	 * @param f
+-	 * @throws GRBException
+-	 */
+-	public void addLPConstraints(Formula satFormula, GRBModel model, FormulaFactory f) throws GRBException {
+-
+-		GRBLinExpr expr = new GRBLinExpr();
+-		// OBJ0: Priority=2 Weight=1 AbsTol=0 RelTol=0
+-		// c1sum
+-		// OBJ1: Priority=1 Weight=1 AbsTol=0 RelTol=0
+-		// c1sumcomplement - c3sum
+-
+-		// Set global sense for ALL objectives
+-
+-		model.set(GRB.IntAttr.ModelSense, GRB.MAXIMIZE);
+-
+-		GRBLinExpr objn0 = new GRBLinExpr();
+-		String vname = "OBJ0";
+-		objn0.addTerm(1.0, model.getVarByName(C1_SUM_VAR));
+-
+-		model.setObjectiveN(objn0, 0, 2, 1, 0, 0, vname);
+-
+-		GRBLinExpr objn1 = new GRBLinExpr();
+-		String vname2 = "OBJ1";
+-		objn1.addTerm(1.0, model.getVarByName(C1COM_SUM_VAR));
+-		objn1.addTerm(-1.0, model.getVarByName(C3_SUM_VAR));
+-
+-		model.setObjectiveN(objn1, 1, 1, 1, 0, 0, vname2);
+-
+-		// add constraints to the ILP model based on the CNF clauses
+-		// this formula doesn't contain any constraint about the cause
+-		CNFEncoder encoder = new CNFEncoder(f, new CNFConfig.Builder().algorithm(CNFConfig.Algorithm.FACTORIZATION).build());
+-	    Formula phi1CNF = encoder.encode(satFormula);
+-		
+-		Iterator<Formula> iter = phi1CNF.iterator();
+-		
+-//		Iterator<Formula> iter = satFormula.cnf().iterator();
+-
+-		while (iter.hasNext()) {
+-			// one clause in the cnf
+-			Formula clause = iter.next();
+-			if (clause.isAtomicFormula()) { // Assignment mainly for the effect and the context
+-				// R118: BS = 0
+-				Literal literal = (Literal) clause;
+-				expr = new GRBLinExpr();
+-				expr.addTerm(1.0, model.getVarByName(literal.name()));
+-				model.addConstr(expr, GRB.EQUAL, literal.phase() ? 1.0 : 0.0, "");
+-			} else {
+-				Iterator<Formula> literals = clause.iterator();
+-
+-				expr = new GRBLinExpr();
+-				while (literals.hasNext()) {
+-					Literal literal = (Literal) literals.next();
+-					if (literal.phase()) {
+-						expr.addTerm(1.0, model.getVarByName(literal.name()));
+-					} else {
+-						expr.addTerm(-1.0, model.getVarByName(literal.name()));
+-						expr.addConstant(1.0);
+-					}
+-				}
+-				try {
+-				model.addConstr(expr, GRB.GREATER_EQUAL, 1.0, "");
+-
+-			} catch (Exception e) {
+-				System.out.println(e.getMessage()+ clause.toString());
+-//				e.printStackTrace();
+-			}
+-			}
+-
+-		}
+-
+-	}
+-
+-
++    @Override
++    CausalitySolverResult solve(CausalModel causalModel, Set<Literal> context, Formula phi,
++                                Set<Literal> cause, SolvingStrategy solvingStrategy)
++            throws InvalidCausalModelException {
++        throw new UnsupportedOperationException("WhySolverCNF requires Gurobi (unavailable)");
++    }
+ }
+diff --git a/src/main/java/de/tum/in/i4/hp2sat/util/FormulaHelper.java b/src/main/java/de/tum/in/i4/hp2sat/util/FormulaHelper.java
+new file mode 100644
+index 0000000..2e81dcb
+--- /dev/null
++++ b/src/main/java/de/tum/in/i4/hp2sat/util/FormulaHelper.java
+@@ -0,0 +1,23 @@
++package de.tum.in.i4.hp2sat.util;
++
++import org.logicng.formulas.Formula;
++import org.logicng.formulas.FormulaFactory;
++import java.util.Collection;
++
++/**
++ * Python-friendly wrappers for FormulaFactory methods whose Java names
++ * are reserved keywords in Python (and, or, not).
++ */
++public class FormulaHelper {
++    public static Formula fAnd(FormulaFactory f, Collection<? extends Formula> operands) {
++        return f.and(operands);
++    }
++
++    public static Formula fOr(FormulaFactory f, Collection<? extends Formula> operands) {
++        return f.or(operands);
++    }
++
++    public static Formula fNot(FormulaFactory f, Formula operand) {
++        return f.not(operand);
++    }
++}
+diff --git a/src/main/java/de/tum/in/i4/hp2sat/util/Util.java b/src/main/java/de/tum/in/i4/hp2sat/util/Util.java
+index 043b19d..3d8e64f 100644
+--- a/src/main/java/de/tum/in/i4/hp2sat/util/Util.java
++++ b/src/main/java/de/tum/in/i4/hp2sat/util/Util.java
+@@ -37,48 +37,4 @@ public class Util<T> {
+         return graphReversed;
+     }
+ 
+-    public static Set<Argument> generateRandomCauseSet(NumericCausalModel causalModel, int numberofcauses) {
+-    	
+-    	        Set<Argument> causes = new LinkedHashSet();     
+-    	        Random r = new Random();
+-    	        
+-    	        for (int i =0; i<numberofcauses; i++) {
+-    	        	int index = r.nextInt(causalModel.getEquationsSorted().size());
+-    	        	 Argument e = causalModel.getEquationsSorted().get(index);
+-    	        	if (!e.getArgumentName().equals("n_0"))	     // reserved for phi   	 
+-    	        		causes.add(new Argument(e.getArgumentName(), e.getArgumentValue()));
+-    	        	else {
+-    	        		 Argument e2 = causalModel.getEquationsSorted().get(index--);
+-    	        		 causes.add(new Argument(e2.getArgumentName(), e2.getArgumentValue()));
+-    	        	}
+-    	        }
+-    	    	return causes;
+-    }
+-    
+-    public static Expression getPhiExpression (NumericCausalModel causalModel) {
+-    	 double rootValue = causalModel.getVaribale("n_0").getArgumentValue();
+-	    	Expression phi;
+-	        if (rootValue<0) {
+-	        	 phi = new Expression("n_0+"+(-1*rootValue)+"= 0", causalModel.getVaribale("n_0"));
+-	        }
+-	        else {
+-	        	 phi = new Expression("n_0-"+rootValue+"= 0", causalModel.getVaribale("n_0"));
+-	        }
+-    	return phi;
+-    }
+-    
+-    public static Expression getContrastivePhiExpression (NumericCausalModel causalModel) {
+-   	 double rootValue = causalModel.getVaribale("n_0").getArgumentValue();
+-	    	Expression phi2;
+-	        if (rootValue<0) {
+-	        	 phi2 = new Expression("n_0+"+((-1*rootValue)+100)+"!= 0", causalModel.getVaribale("n_0")); 
+-	        }
+-	        else {
+-	        	 phi2 = new Expression("n_0-"+(rootValue+100)+"!= 0", causalModel.getVaribale("n_0")); 
+-	        }
+-	       return phi2;
+-   	
+-   	
+-   	
+-   }
+ }
+diff --git a/src/main/java/org/mariuszgromada/math/mxparser/NumericCausalModel.java b/src/main/java/org/mariuszgromada/math/mxparser/NumericCausalModel.java
+index 65f333a..572872b 100644
+--- a/src/main/java/org/mariuszgromada/math/mxparser/NumericCausalModel.java
++++ b/src/main/java/org/mariuszgromada/math/mxparser/NumericCausalModel.java
+@@ -1,391 +1,9 @@
+ package org.mariuszgromada.math.mxparser;
+ 
+-import de.tum.in.i4.hp2sat.causality.CausalitySolver;
+-import de.tum.in.i4.hp2sat.causality.CausalitySolverResult;
+-import de.tum.in.i4.hp2sat.causality.Equation;
+-import de.tum.in.i4.hp2sat.causality.ILPCausalitySolver;
+-import de.tum.in.i4.hp2sat.causality.NumericCausalitySolver;
+-import de.tum.in.i4.hp2sat.causality.SATCausalitySolver;
+-import de.tum.in.i4.hp2sat.causality.SATSolverType;
+-import de.tum.in.i4.hp2sat.causality.SolvingStrategy;
+-import de.tum.in.i4.hp2sat.exceptions.InvalidCausalModelException;
+-import de.tum.in.i4.hp2sat.exceptions.InvalidCauseException;
+-import de.tum.in.i4.hp2sat.exceptions.InvalidContextException;
+-import de.tum.in.i4.hp2sat.exceptions.InvalidPhiException;
+-import de.tum.in.i4.hp2sat.util.Util;
+-import gurobi.GRBException;
+-
+-import org.graphstream.algorithm.TopologicalSortDFS;
+-import org.graphstream.graph.Graph;
+-import org.graphstream.graph.Node;
+-import org.graphstream.graph.implementations.SingleGraph;
+-import org.logicng.formulas.Variable;
+-import org.mariuszgromada.math.mxparser.Argument;
+-import org.mariuszgromada.math.mxparser.Expression;
+-
+-import java.util.HashSet;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.Map;
+ import java.util.Set;
+-import java.util.function.Function;
+-import java.util.stream.Collectors;
+ 
+ public class NumericCausalModel {
+-	private String name;
+-	private Set<Argument> exogenousVariables;
+-
+-	private Map<String, Argument> variableEquationMap;
+-	private Graph graph;
+-	private Graph graphReversed;
+-	private List<Argument> equationsSorted; // according to topological sort
+-
+-	/**
+-	 * Creates a new causal model
+-	 *
+-	 * @param name               name of the causal model
+-	 * @param equations          equations for the endogenous variables of the
+-	 *                           causal model
+-	 * @param exogenousVariables the exogenous variables of the causal model
+-	 * @param formulaFactory     a formula factory
+-	 * @throws InvalidCausalModelException throws an exception if model is not
+-	 *                                     valid: (1) each variable needs to be
+-	 *                                     either defined by an equation or be
+-	 *                                     exogenous; (2) no duplicate definition of
+-	 *                                     variables; (3) no circular dependencies;
+-	 *                                     (4) an exogenous variable must not be
+-	 *                                     called like
+-	 *                                     {@link SATCausalitySolver#DUMMY_VAR_NAME}
+-	 */
+-	public NumericCausalModel(String name, Set<Argument> equations, Set<Argument> exogenousVariables)
+-			throws InvalidCausalModelException {
+-		this(name, equations, exogenousVariables, true);
+-
+-	}
+-
+-	/**
+-	 * Same as
+-	 * {@link NumericCausalModel#CausalModel(String, Set, Set, FormulaFactory)}, but
+-	 * allows to specify if validity is checked. For internal use only.
+-	 *
+-	 * @param name
+-	 * @param equations
+-	 * @param exogenousVariables
+-	 * @param checkValidity
+-	 * @throws InvalidCausalModelException
+-	 */
+-	private NumericCausalModel(String name, Set<Argument> equations, Set<Argument> exogenousVariables,
+-			boolean checkValidity) throws InvalidCausalModelException {
+-		this.name = name;
+-		this.exogenousVariables = exogenousVariables;
+-
+-		if (checkValidity) {
+-			// throws an exception if invalid
+-			isValid(equations, exogenousVariables);
+-		}
+-		this.variableEquationMap = equations.stream()
+-				.collect(Collectors.toMap(Argument::getArgumentName, Function.identity()));
+-		this.graph = this.toGraph();
+-		equationsSorted = this.sortEquations();
+-	}
+-
+-//	/**
+-//	 * Creates a copy of the passed causal model in which only the equation that
+-//	 * define the passed variables are copied. IMPORTANT: We skip the validity check
+-//	 * when calling this constructor!
+-//	 *
+-//	 * @param causalModel the causal model that is copied
+-//	 * @param variables   the variables whose equations are copied
+-//	 */
+-//	NumericCausalModel(NumericCausalModel causalModel, Set<Argument> variables) throws InvalidCausalModelException {
+-//		/*
+-//		 * we assume that this constructor is called only, if we know that the original
+-//		 * causal model is valid. Thereforce, we skip the validity check.
+-//		 */
+-//		this(causalModel.name, causalModel.variableEquationMap.values().stream()
+-//				.map(e -> variables.contains(e.getVariable()) ? new Equation(e) : e).collect(Collectors.toSet()),
+-//				causalModel.exogenousVariables,  false);
+-//	}
+-
+-	/**
+-	 * Determines whether the passed set of Literals is a cause for the given phi.
+-	 * For both phi and cause, a positive/negative literal means that the variable
+-	 * is meant to be true/false. The context defines the exogenous variables. Each
+-	 * variable is assigned a Constant (CTrue/CTFalse).
+-	 *
+-	 * @param context the context of the causal scenario; defines the values of the
+-	 *                exogenous variables
+-	 * @param phi     the literals (i.e. events) we want to check for whether the
+-	 *                given cause is indeed a cause
+-	 * @param cause   the set of literals (i.e. primitive events) we want to check
+-	 *                for being a cause for phi
+-	 * @return the result of the SAT Solver, i.e. true, false or undefined
+-	 * @throws InvalidContextException thrown if context is invalid: (1) each
+-	 *                                 exogenous variable needs to be defined; (2)
+-	 *                                 no other variable than the exogenous variable
+-	 *                                 are in the Map
+-	 * @throws InvalidCauseException   thrown if the cause is invalid: each literal
+-	 *                                 of the cause needs to be defined in the
+-	 *                                 equations
+-	 * @throws InvalidPhiException     thrown if phi is invalid: each literal of phi
+-	 *                                 needs to be defined in the equations
+-	 * @throws GRBException 
+-	 */
+-	public CausalitySolverResult isCause( Map<String, Double> context, Expression phi, Set<Argument> cause, double BIGM,  double upperBound, double lowerBound)
+-			throws InvalidContextException, InvalidCauseException, InvalidPhiException, InvalidCausalModelException, GRBException {
+-		
+-		NumericCausalitySolver cm = new NumericCausalitySolver(BIGM,upperBound,lowerBound);
+-		
+-		return cm.solve(this, context, phi, cause, SolvingStrategy.ILP_NUM);
+-		
+-	}
+-
+-	/**
+-	 * see {@link #isCause(Set, Formula, Set, SolvingStrategy, SATSolverType)} for a
+-	 * full documentation. The only difference is that in the current method the to
+-	 * be used SAT solver can be specified. This only works if the solving strategy
+-	 * refers to {@link SATCausalitySolver}. Otherwise,
+-	 * {@link #isCause(Set, Formula, Set, SolvingStrategy)} is called, i.e. the SAT
+-	 * solver type is ignored.
+-	 *
+-	 * @param context
+-	 * @param phi
+-	 * @param cause
+-	 * @param solvingStrategy
+-	 * @param satSolverType
+-	 * @return
+-	 * @throws InvalidContextException
+-	 * @throws InvalidCauseException
+-	 * @throws InvalidPhiException
+-	 * @throws InvalidCausalModelException
+-	 */
+-	public CausalitySolverResult isCause(Set<Argument> context, Expression phi, Set<Argument> cause,
+-			SolvingStrategy solvingStrategy, SATSolverType satSolverType)
+-			throws InvalidContextException, InvalidCauseException, InvalidPhiException, InvalidCausalModelException {
+-			validateCausalityCheck(context, phi, cause);
+-			SATCausalitySolver satCausalitySolver = new SATCausalitySolver();
+-			return null;
+-			//return satCausalitySolver.solve(this, context, phi, cause, solvingStrategy, satSolverType);
+-	}
+-
+-	/**
+-	 * Checks whether the given equations and exogenous variables are valid.
+-	 *
+-	 * @param equations          the equations
+-	 * @param exogenousVariables the exogenous variables
+-	 * @return true if valid
+-	 * @throws InvalidCausalModelException thrown if invalid
+-	 */
+-	private boolean isValid(Set<Argument> endogenousVars, Set<Argument> exogenousVariables)
+-			throws InvalidCausalModelException {
+-		// get all variables
+-		Set<Argument> variables = new HashSet<>();
+-		for (Iterator<Argument> iterator = endogenousVars.iterator(); iterator.hasNext();) {
+-			Argument argument = iterator.next();
+-			variables.add(argument);
+-			for (int j = 0; j < argument.getArgumentsNumber(); j++) {
+-				variables.add(argument.getArgument(j));
+-			}
+-		}
+-		
+-		
+-		variables.addAll(exogenousVariables);
+-
+-		boolean existsDefinitionForEachVariable = endogenousVars.size() + exogenousVariables.size() == variables.size();
+-		boolean existsNoDuplicateEquationForEachVariable = endogenousVars.size() == endogenousVars.stream()
+-				.map(Argument::getArgumentName).collect(Collectors.toSet()).size();
+-		// TODO no cyclic check for now
+-		// boolean existsCircularDependency = endogenousVars.parallelStream()
+-		// .anyMatch(e -> isVariableInEquation(e.getVariable(), e, equations));
+-
+-		if (!(existsDefinitionForEachVariable && existsNoDuplicateEquationForEachVariable))
+-			throw new InvalidCausalModelException();
+-
+-		return true;
+-	}
+-
+-	/**
+-	 * Checks whether a given variable is within a given equation or within the
+-	 * equations of the variables used within the given equation (recursive!)
+-	 *
+-	 * @param variable  the variable for which we want to know whether it is in the
+-	 *                  given equation
+-	 * @param equation  the equation within which we search for the variable
+-	 * @param equations the equations
+-	 * @return true, if variable was found; otherwise false
+-	 */
+-	private boolean isVariableInEquation(Argument variable, Equation equation, Set<Equation> equations) {
+-		Set<Variable> variables = equation.getFormula().variables();
+-		// check if formula of equation contains variable
+-		if (variables.contains(variable)) {
+-			return true;
+-		}
+-
+-		// check for all other non-exogenous variables whether their corresponding
+-		// equation contains the searched var
+-		for (Variable v : variables.stream().filter(v -> !this.exogenousVariables.contains(v) && !v.equals(variable))
+-				.collect(Collectors.toSet())) {
+-			Equation eq = equations.stream().filter(e -> e.getVariable().equals(v)).findFirst().orElse(null);
+-			/*
+-			 * if eq is null, this would mean that a variable has no definition; this will
+-			 * be captured by another check in the isValid() method. Since the current
+-			 * method is private, we can ignore the case here.
+-			 */
+-			if (eq != null) {
+-				if (isVariableInEquation(variable, eq, equations))
+-					return true;
+-			}
+-		}
+-
+-		return false;
+-	}
+-
+-	/**
+-	 * Converts this causal model into a graph. Needed for evaluation.
+-	 *
+-	 * @return the causal model as graph
+-	 */
+-	private Graph toGraph() {
+-		Graph graph = new SingleGraph(this.name != null ? this.name : "");
+-		// create all nodes
+-		this.variableEquationMap.values().forEach(e -> graph.addNode(e.getArgumentName()));
+-		this.getExogenousVariables().forEach(e -> graph.addNode(e.getArgumentName()));
+-		// create edges
+-		
+-		
+-		this.variableEquationMap.values().forEach(e -> {
+-			String equationVariableName = e.getArgumentName();
+-			for (int i = 0; i < e.getArgumentsNumber(); i++) {
+-				
+-				String variableName = e.getArgument(i).getArgumentName();
+-				graph.addEdge(equationVariableName + "-" + variableName, variableName, equationVariableName, true);
+-			}
+-			});
+-
+-		return graph;
+-	}
+-
+-	/**
+-	 * Checks if the given context is valid
+-	 *
+-	 * @param context the to be checked context
+-	 * @return true if valid, else false
+-	 */
+-	private boolean isContextValid(Set<Argument> context) {
+-		// each and only each exogenous variable must be defined by context
+-		return context.size() == exogenousVariables.size();
+-	}
+-
+-	/**
+-	 * Checks if the given literals (i.e. cause, phi or W) are in the Variable part
+-	 * of the equations of this causal model.
+-	 *
+-	 * @param literals the to be checked literals
+-	 * @return true if all the literals are in the Variable part of the equations of
+-	 *         this causal model, else false
+-	 */
+-	private boolean isArgumnetsInExpression(Set<? extends Argument> argumnets) {
+-		return this.variableEquationMap.values().containsAll(argumnets);
+-	}
+-
+-	/**
+-	 * Make sure that the passed context, phi and cause are valid for the current
+-	 * causal model.
+-	 *
+-	 * @param context the context
+-	 * @param phi     the phi
+-	 * @param cause   the cause
+-	 * @throws InvalidCauseException
+-	 * @throws InvalidPhiException
+-	 * @throws InvalidContextException
+-	 */
+-	private void validateCausalityCheck(Set<Argument> context, Expression phi, Set<Argument> cause)
+-			throws InvalidCauseException, InvalidPhiException, InvalidContextException {
+-		if (!isContextValid(context))
+-			throw new InvalidContextException();
+-		Set<Argument> argumentsInPhi = new HashSet<>();
+-		
+-		for (int i = 0; i <phi.getArgumentsNumber(); i++) {
+-			argumentsInPhi.add(phi.getArgument(i));
+-		}
+-		if (!isArgumnetsInExpression(argumentsInPhi))
+-			throw new InvalidPhiException();
+-		if (!isArgumnetsInExpression(cause) || cause.size() < 1)
+-			throw new InvalidCauseException();
+-	}
+-
+-	/**
+-	 * Sort the equations of the causal model according to the total order proposed
+-	 * by Halpern.
+-	 *
+-	 * @return an ordered list of equations
+-	 */
+-	private List<Argument> sortEquations() {
+-		// get the causal model as graph
+-		Graph graph = this.getGraph();
+-		/*
+-		 * Following to HP, we can sort variables in an acyclic causal model according
+-		 * to their dependence on other variables. The following applies: "If X < Y,
+-		 * then the value of X may affect the value of Y , but the value of Y cannot
+-		 * affect the value of X" The problem is that we only obtain a partial order if
+-		 * we define < as X is contained in Y (or recursively in the variables in the
+-		 * equation of Y) if X < Y. Therefore, we use a topological sort.
+-		 */
+-		TopologicalSortDFS topologicalSortDFS = new TopologicalSortDFS();
+-		topologicalSortDFS.init(graph);
+-		topologicalSortDFS.compute();
+-		// get sorted nodes
+-		List<Node> sortedNodes = topologicalSortDFS.getSortedNodes();
+-		// get sorted list of equations
+-		List<Argument> equationsSorted = sortedNodes.stream()
+-				// filter nodes representing endogenous variables
+-				.filter(n -> !this.getExogenousVariables().stream().map(Argument::getArgumentName).collect(Collectors.toSet())
+-						.contains(n.getId()))
+-				// get corresponding equation
+-				.map(n -> this.getVariableEquationMap().get(n.getId())).collect(Collectors.toList());
+-		return equationsSorted;
+-	}
+-
+-	public String getName() {
+-		return name;
+-	}
+-
+-	public Set<Argument> getExogenousVariables() {
+-		return exogenousVariables;
+-	}
+-
+-	public Map<String, Argument> getVariableEquationMap() {
+-		return variableEquationMap;
+-	}
+-
+-	public Graph getGraph() {
+-		return graph;
+-	}
+-
+-	public Graph getGraphReversed() {
+-		if (this.graphReversed == null) {
+-			this.graphReversed = Util.reverseGraph(this.graph);
+-		}
+-		return graphReversed;
+-	}
+-
+-	public List<Argument> getEquationsSorted() {
+-		return equationsSorted;
+-	}
+-	public Expression getExpression (Argument ar) {
+-		return ar.argumentExpression;
+-		
+-	}
+-
+-	public Argument getVaribale(String string) {
+-		return variableEquationMap.get(string);
+-	}
+-
+-	
+-	public void print () {
+-		System.out.println("Model "+ getName()+" size:"+ exogenousVariables.size()+" exogenous vars, and "+equationsSorted.size()+" endogenous"  );
+-		exogenousVariables.stream().forEach(e-> System.out.println("EX "+e.getArgumentName()+"= "+e.getArgumentValue() ));
+-//		variableEquationMap.entrySet().stream().forEach(e-> System.out.println(e.getKey()+"= "+e.getValue().getArgumentExpressionString()+" ="+e.getValue().getArgumentValue()));
+-		equationsSorted.stream().forEach(e-> System.out.println(e.getArgumentName()+"= "+e.getArgumentValue()));
+-	}
++    public NumericCausalModel(String name, Set<Argument> equations, Set<Argument> exogenousVariables) {
++        throw new UnsupportedOperationException("NumericCausalModel requires Gurobi (unavailable)");
++    }
+ }
+diff --git a/src/main/java/org/mariuszgromada/math/mxparser/Test.java b/src/main/java/org/mariuszgromada/math/mxparser/Test.java
+index 220e7e2..18b7a60 100644
+--- a/src/main/java/org/mariuszgromada/math/mxparser/Test.java
++++ b/src/main/java/org/mariuszgromada/math/mxparser/Test.java
+@@ -1,125 +1,7 @@
+ package org.mariuszgromada.math.mxparser;
+ 
+-import java.util.List;
+-
+-import org.mariuszgromada.math.mxparser.parsertokens.Operator;
+-import org.mariuszgromada.math.mxparser.parsertokens.ParserSymbol;
+-import org.mariuszgromada.math.mxparser.parsertokens.Token;
+-
+-import gurobi.GRB;
+-import gurobi.GRBException;
+-import gurobi.GRBLinExpr;
+-import gurobi.GRBModel;
+-import gurobi.GRBVar;
+-
+ public class Test {
+-	
+-	
+-	private static final String DISTANCE_VAR_NAME = "res";
+-	private static final String IND_1_PREFIX = "IND1_";
+-	private static final String IND_2_PREFIX = "IND2_";
+-	private static final String SLACK_1_PREFIX = "SLA1_";
+-	private static final String SLACK_2_PREFIX = "SLA2_";
+-
+-
+-	public static void main(String[] args) {
+-		
+-		// Examples of Exos
+-		Argument z = new Argument("z", 3.2);
+-		Argument n = new Argument("n", 4);
+-//		         
+-		// Example of Endos
+-		Argument x = new Argument("x = 5 * z",z);     
+-		Argument y = new Argument("y = x - 3 * n + (z + 5)", n,z,x);
+-		Argument x1 = new Argument("x1= y + 100", y);   
+-		
+-		
+-		
+-		
+-//		System.out.println(y.argumentExpression);
+-		Expression e = new Expression("z=3.2+8", z);
+-		mXparser.consolePrintTokens(e.getCopyOfInitialTokens());
+-		//
+-	
+-//		mXparser.consolePrintln("Res 4: " + e.getExpressionString() + " = " + e.));
+-
+-	
+-	
+-		}
+-
+-	
+-	// this function can be used for representing the linear equalities of variables. We use this 
+-	// for Phi vars and the first part of the disjunctive constraints
+-	// Examples OF fX in mind:  X + y +4 ;-x - y- 4;3*Y + 5*x -40; -3 *Y - 5*X + 40 ; 3 + Z; 400
+-	public static void toLinearEquality (Argument variable, Expression equation, boolean isDisjunctive,GRBModel model, boolean addSlack) throws GRBException {
+-		// we need to turn the equation to the equality: Fx - V = 0 
+-		
+-		List<Token> tokens = equation.getCopyOfInitialTokens();
+-		Double currentCoefficient = null;
+-		double sign = 1.0; // 1.0 or -1.0 
+-		GRBLinExpr expr= null;
+-		GRBVar currentArgument = null;
+-		for (int i = 0; i < tokens.size(); i++) {
+-			 expr = new GRBLinExpr();
+-			Token token = tokens.get(i);
+-			// loop the tokens if tokentypeid= 101 which is an argument; 
+-			// then get the Gurobi variable of this;
+-			// each term is an operator, coefficient, and an argument. A term could also be a constant 
+-			if (token.tokenTypeId == Argument.TYPE_ID) {
+-				currentArgument = model.getVarByName(token.tokenStr);
+-			} else if (token.tokenTypeId == ParserSymbol.NUMBER_TYPE_ID) {
+-				// if it was type id = 0 then it is a 
+-				//number that can be a coefficient or a constant in an equation 
+-				currentCoefficient = token.tokenValue;
+-				if (i==tokens.size()-1) {// if this is the last element (number)
+-					expr.addConstant(currentCoefficient*sign);
+-				}
+-			}
+-			else if (token.tokenTypeId == Operator.TYPE_ID) {// + - * /...
+-				// if it was 1 then it is an operator 
+-				if ((token.tokenId == Operator.PLUS_ID) || (token.tokenId == Operator.MINUS_ID) ) {
+-					// when i get a +- not at the beginning i add the previous Term or constant, and use the operator as sign for next
+-					if ( i != 0 ) { 
+-						if (currentArgument!= null)
+-							expr.addTerm(currentCoefficient*sign, currentArgument);
+-						else if (currentCoefficient!=null)
+-							expr.addConstant(currentCoefficient*sign);
+-					}
+-					// set next term sign
+-					sign = (token.tokenId == Operator.PLUS_ID)? 1.0: -1.0;
+-					currentCoefficient= null;
+-					currentArgument = null;
+-				}else {
+-
+-					// this is a *; should we do anything
+-				}
+-
+-
+-
+-			}
+-			else if (token.NOT_MATCHED==1) { // TODO handle unmatched tokens
+-
+-			}
+-		}
+-
+-		// The expression so far simulates Fx; Now Fx-V = 0 
+-		expr.addTerm(-1.0, model.getVarByName(variable.getArgumentName()));
+-		
+-		if (addSlack) {
+-			expr.addTerm(1.0, model.getVarByName(SLACK_1_PREFIX+variable.getArgumentName()));
+-			// the constraints of the slack and the indicator vars are already added; this would be another location to add them
+-			// Now lets add the second constraint to account fow W; V - v + w2 = 0
+-			GRBLinExpr contingencyExpression = new GRBLinExpr();
+-			contingencyExpression.addTerm(1, model.getVarByName(variable.getArgumentName()));
+-			contingencyExpression.addConstant(-variable.getArgumentValue());
+-			contingencyExpression.addTerm(1,model.getVarByName(SLACK_2_PREFIX+variable.getArgumentName()));
+-			
+-			model.addConstr(contingencyExpression, GRB.EQUAL, 0.0, "R_2_" +variable.getArgumentName());
+-		}
+-		
+-		// finalize the constraint and add it 
+-		model.addConstr(expr, GRB.EQUAL, 0.0, "R_" +variable.getArgumentName());
+-	}
+-	}
+-
+-
++    public static void main(String[] args) {
++        throw new UnsupportedOperationException("Test requires Gurobi (unavailable)");
++    }
++}
+diff --git a/src/test/java/de/tum/in/i4/hp2sat/causality/Playground.java b/src/test/java/de/tum/in/i4/hp2sat/causality/Playground.java
+index b42f6ed..87a4603 100644
+--- a/src/test/java/de/tum/in/i4/hp2sat/causality/Playground.java
++++ b/src/test/java/de/tum/in/i4/hp2sat/causality/Playground.java
+@@ -1,279 +1,7 @@
+ package de.tum.in.i4.hp2sat.causality;
+ 
+-import java.util.Arrays;
+-import java.util.HashSet;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.Set;
+-
+-import org.junit.Test;
+-import org.logicng.formulas.*;
+-import org.logicng.io.parsers.ParserException;
+-import org.logicng.io.parsers.PropositionalParser;
+-
+-import de.tum.in.i4.hp2sat.causality.CausalModel;
+-import de.tum.in.i4.hp2sat.exceptions.InvalidCausalModelException;
+-import de.tum.in.i4.hp2sat.util.ExampleProvider;
+-import gurobi.GRB;
+-import gurobi.GRBEnv;
+-import gurobi.GRBException;
+-import gurobi.GRBLinExpr;
+-import gurobi.GRBModel;
+-import gurobi.GRBVar;
+-
+ public class Playground {
+-
+-	@Test
+-	public void assignmentAndSat() throws ParserException, GRBException, InvalidCausalModelException {
+-		FormulaFactory f = new FormulaFactory();
+-
+-		PropositionalParser pp = new PropositionalParser(f);
+-		Formula formula = pp.parse(
+-				"~BS & ST_exo & BT_exo & (BS | (BS <=> SH | BH)) & (XT | ~XT ) & (~BT | BT ) & (SH | (SH <=> XT)) & (~BH | (BH <=> BT & ~SH))");
+-		// ~BS & ST_exo & BT_exo & (BS | (BS <=> SH | BH)) & (ST | ~ST ) & (~BT
+-		// | BT ) & (SH | (SH <=> ST)) & (~BH | (BH <=> BT & ~SH))
+-		// TODO should be changed to the cause
+-		List<String> causes = Arrays.asList("XT", "BT");
+-		GRBEnv env = new GRBEnv("mip1.log");
+-		GRBModel model = new GRBModel(env);
+-		CausalModel cm = ExampleProvider.billySuzy();
+-		addLPVars(cm, model);
+-		// 1>= res <= size of causes set
+-		GRBVar res = model.addVar(1.0, causes.size(), 0.0, GRB.INTEGER, "res");
+-		// Set objective: min res
+-		GRBLinExpr expr = new GRBLinExpr();
+-		expr.addTerm(1.0, res);
+-		model.setObjective(expr, GRB.MINIMIZE);
+-
+-		// Apparently should call this method so that the model is in sync
+-		model.update();
+-		// this should be the fastest way to loop
+-		// add constraints
+-		Iterator<Formula> iter = formula.cnf().iterator();
+-		while (iter.hasNext()) {
+-			// one clause in the cnf
+-			Formula clause = iter.next();
+-			if (clause.isAtomicFormula()) { // Assignment
+-				// R118: BS = 0
+-				Literal literal = (Literal) clause;
+-				// System.out.println(literal+" ATOMIC:
+-				// "+literal.isAtomicFormula()+"
+-				// "+literal.iterator().hasNext()+" "+ (literal.name())+"
+-				// "+(literal.phase()? 1.0: 0.0));
+-				expr = new GRBLinExpr();
+-				expr.addTerm(1.0, model.getVarByName(literal.name()));
+-				model.addConstr(expr, GRB.EQUAL, literal.phase() ? 1.0 : 0.0, "R_" + literal);
+-			} else {
+-				Iterator<Formula> literals = clause.iterator();
+-				expr = new GRBLinExpr();
+-				while (literals.hasNext()) {
+-					Literal literal = (Literal) literals.next();
+-					// System.out.println(" "+literal+" ATOMIC: "+" "+
+-					// literal.name()+" "+ literal.phase() );
+-					// e.g R140: XT + NXT >= 1
+-					if (literal.phase()) {
+-						expr.addTerm(1.0, model.getVarByName(literal.name()));
+-					} else {
+-						expr.addTerm(-1.0, model.getVarByName(literal.name()));
+-						expr.addConstant(1.0);
+-					}
+-				}
+-				model.addConstr(expr, GRB.GREATER_EQUAL, 1.0, "R_" + clause);
+-			}
+-
+-		}
+-
+-		// res+ what was 1 - what was zero = the sum of all what was
+-		// res = segma Di Di = {1-x xact = 1 x xact=0}
+-		// Rres: res = 1- BT + 1- XT {BTact,XTact=1}
+-
+-		Set<Literal> evaluation = new HashSet<>(Arrays.asList(f.literal("BT", true), f.literal("XT", true)));
+-		expr = new GRBLinExpr();
+-		// TODO should check what to change it too, this should be the causes
+-		// and their actual values
+-		Iterator<Literal> causesItr = evaluation.iterator();
+-		while (causesItr.hasNext()) {
+-			Literal literal = causesItr.next();
+-			if (literal.phase()) {
+-				expr.addConstant(1.0);
+-				expr.addTerm(-1.0, model.getVarByName(literal.name()));
+-			} else {
+-				expr.addTerm(1.0, model.getVarByName(literal.name()));
+-			}
+-		}
+-
+-		model.addConstr(res, GRB.EQUAL, expr, "R_result");
+-		// Optimize model
+-		model.optimize();
+-
+-		GRBVar[] fvars = model.getVars();
+-		double[] x = model.get(GRB.DoubleAttr.X, fvars);
+-		String[] vnames = model.get(GRB.StringAttr.VarName, fvars);
+-
+-		for (int j = 0; j < fvars.length; j++) {
+-			if (x[j] != 0.0) {
+-				System.out.println(vnames[j] + " " + x[j]);
+-			}
+-		}
+-
+-		// Dispose of model and environment
+-		model.write("./ptest.lp");
+-		model.dispose();
+-		env.dispose();
+-	}
+-
+-	// @Test
+-	// TODO turn this into a test case
+-	public void createLP() {
+-		try {
+-			GRBEnv env = new GRBEnv("mip1.log");
+-			GRBModel model = new GRBModel(env);
+-
+-			// Create variables
+-			// The first and second arguments to the addVar() call are the
+-			// variable lower and upper bounds,
+-			// respectively. The third argument is the linear objective
+-			// coefficient (zero here - we’ll set the objective
+-			// later). The fourth argument is the variable type
+-			// somehow the variable declaration is affecting the result.
+-			GRBVar ST_EXO = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, "ST_EXO");
+-			GRBVar BT_EXO = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, "BT_EXO");
+-
+-			GRBVar XT = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, "XT");
+-			GRBVar BT = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, "BT");
+-
+-			GRBVar SH = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, "SH");
+-			GRBVar BH = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, "BH");
+-			GRBVar BS = model.addVar(0.0, 1.0, 0.0, GRB.BINARY, "BS");
+-
+-			GRBVar res = model.addVar(0.0, 2.0, 0.0, GRB.INTEGER, "res");
+-			// Set objective: min res
+-			GRBLinExpr expr = new GRBLinExpr();
+-			expr.addTerm(1.0, res);
+-			model.setObjective(expr, GRB.MINIMIZE);
+-
+-			// R118: BS = 0
+-			expr = new GRBLinExpr();
+-			expr.addTerm(1.0, BS);
+-			model.addConstr(expr, GRB.EQUAL, 0.0, "R118");
+-			// R119: ST_exo = 1
+-			expr = new GRBLinExpr();
+-			expr.addTerm(1.0, ST_EXO);
+-			model.addConstr(expr, GRB.EQUAL, 1.0, "R119");
+-			// R120: BT_exo = 1
+-			expr = new GRBLinExpr();
+-			expr.addTerm(1.0, BT_EXO);
+-			model.addConstr(expr, GRB.EQUAL, 1.0, "R120");
+-
+-			// R140: XT + NXT >= 1
+-			expr = new GRBLinExpr();
+-			expr.addTerm(1.0, XT);
+-			expr.addTerm(-1.0, XT);
+-			model.addConstr(expr, GRB.GREATER_EQUAL, 0.0, "R140");
+-			// R141: BT - BT >= 0
+-			expr = new GRBLinExpr();
+-			expr.addTerm(1.0, BT);
+-			expr.addTerm(-1.0, BT);
+-			model.addConstr(expr, GRB.GREATER_EQUAL, 0.0, "R141");
+-			// R122: SH - XT >= 0
+-			expr = new GRBLinExpr();
+-			expr.addTerm(1.0, SH);
+-			expr.addTerm(-1.0, XT);
+-			model.addConstr(expr, GRB.GREATER_EQUAL, 0.0, "R122");
+-			// R124: BT - BH >= 0
+-			expr = new GRBLinExpr();
+-			expr.addTerm(1.0, BT);
+-			expr.addTerm(-1.0, BH);
+-			model.addConstr(expr, GRB.GREATER_EQUAL, 0.0, "R124");
+-			// R125: - BT - BH >= -1
+-			expr = new GRBLinExpr();
+-			expr.addTerm(-1.0, BT);
+-			expr.addTerm(-1.0, BH);
+-			model.addConstr(expr, GRB.GREATER_EQUAL, -1.0, "R125");
+-
+-			// R126: BS - SH >= 0
+-			expr = new GRBLinExpr();
+-			expr.addTerm(1.0, BS);
+-			expr.addTerm(-1.0, SH);
+-			model.addConstr(expr, GRB.GREATER_EQUAL, 0.0, "R126");
+-			// R127: BS - BH >= 0
+-			expr = new GRBLinExpr();
+-			expr.addTerm(1.0, BS);
+-			expr.addTerm(-1.0, BH);
+-			model.addConstr(expr, GRB.GREATER_EQUAL, 0.0, "R127");
+-
+-			// Rres: res + BT + XT >= 2
+-			expr = new GRBLinExpr();
+-			expr.addTerm(1.0, res);
+-			expr.addTerm(1.0, BT);
+-			expr.addTerm(1.0, XT);
+-			model.addConstr(expr, GRB.EQUAL, 2.0, "Rres");
+-			// Optimize model
+-			// res2: res >= 1
+-			expr = new GRBLinExpr();
+-			expr.addTerm(1.0, res);
+-			model.addConstr(expr, GRB.GREATER_EQUAL, 1.0, "Rres2");
+-			model.optimize();
+-
+-			GRBVar[] fvars = model.getVars();
+-			double[] x = model.get(GRB.DoubleAttr.X, fvars);
+-			String[] vnames = model.get(GRB.StringAttr.VarName, fvars);
+-
+-			for (int j = 0; j < fvars.length; j++) {
+-				if (x[j] != 0.0) {
+-					System.out.println(vnames[j] + " " + x[j]);
+-				}
+-			}
+-
+-			// System.out.println("Obj: " + model.get(GRB.DoubleAttr.ObjVal));
+-
+-			// Dispose of model and environment
+-			model.write("./ptest.lp");
+-			model.dispose();
+-			env.dispose();
+-
+-		} catch (GRBException e) {
+-			System.out.println("Error code: " + e.getErrorCode() + ". " + e.getMessage());
+-		}
+-	}
+-
+-	/**
+-	 * a function that turns a custom causal model to Gurobi causal model the
+-	 * location should be changed to inside the causal model for example 
+-	 * TODO check if we can do this with addvars
+-	 * 
+-	 * @param cm
+-	 * @param model
+-	 */
+-	public void addLPVars(CausalModel cm, GRBModel model) throws GRBException {
+-		// start with exo vars
+-
+-		cm.getExogenousVariables().forEach(item -> {
+-			try {
+-				model.addVar(0.0, 1.0, 0.0, GRB.BINARY, item.name());
+-
+-			} catch (GRBException e) {
+-				e.printStackTrace();
+-			}
+-		});
+-
+-		cm.getEquationsSorted().forEach(e -> {
+-			try {
+-				model.addVar(0.0, 1.0, 0.0, GRB.BINARY, e.getVariable().name());
+-			} catch (GRBException e1) {
+-				// TODO Auto-generated catch block
+-				e1.printStackTrace();
+-			}
+-		});
+-	}
+-
+-	/**
+-	 * a function that converts CNF clauses to GRB constraints
+-	 * 
+-	 * @param fm
+-	 * @param model
+-	 */
+-	public void addLPConstraints(Formula fm, GRBModel model) throws GRBException {
+-
+-	}
++    public static void main(String[] args) throws Exception {
++        System.out.println("Playground stub — Gurobi not available");
++    }
+ }

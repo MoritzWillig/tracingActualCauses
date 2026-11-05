@@ -1,0 +1,29 @@
+diff --git a/src/actualcauses/isi.py b/src/actualcauses/isi.py
+index ed02eea..5c5d642 100644
+--- a/src/actualcauses/isi.py
++++ b/src/actualcauses/isi.py
+@@ -90,6 +90,8 @@ def check_memory(memory, K):
+ 
+ def iterative_identification(v, D, simulation, V, dag, PA_T, cache_size=-1, **kargs):
+     PA = dag
++    if not D:
++        return []
+     minimality = max(map(len,D)) <= 2
+     verbose = kargs.get("verbose", 0)
+     early_stop = kargs.get("early_stop", False)
+diff --git a/src/actualcauses/mbs.py b/src/actualcauses/mbs.py
+index 9e77dac..b50a774 100644
+--- a/src/actualcauses/mbs.py
++++ b/src/actualcauses/mbs.py
+@@ -98,7 +98,10 @@ def get_initial_rules(V, D, v):
+     return rules
+ 
+ def filter_instance(V, D, v, I):
+-    return zip(*[(variable, domain, value) for variable, domain, value in zip(V, D, v) if variable in I])
++    filtered = [(variable, domain, value) for variable, domain, value in zip(V, D, v) if variable in I]
++    if not filtered:
++        return [], [], []
++    return zip(*filtered)
+ 
+ def get_rules(previous_rules, V, D, v, actual_values, Cs=[], R=[], verbose=False):
+     # Build new rules on top of the previous ones
